@@ -257,7 +257,7 @@ class _DppTest(test_util.TestCase):
       binary = bin(i)[2:]
       subset = [0] * n_points
       subset[-len(binary):] = [int(c) for c in binary]
-      mask = np.array(subset, np.bool)
+      mask = np.array(subset, np.bool_)
       submatrix = true_kernel[mask][:, mask]
       expected = (tf.linalg.logdet(submatrix) -
                   tf.linalg.logdet(true_kernel +
@@ -338,7 +338,7 @@ class _DppTest(test_util.TestCase):
 
     _, eigvals, eigvecs = kernel_over_unit_square(20, dtype=self.param_dtype)
     for n in 1, 5:
-      @tf.function(experimental_compile=True)
+      @tf.function(jit_compile=True)
       def f(eigvals):
         return tfd.DeterminantalPointProcess(eigvals, eigvecs).sample(
             n, seed=test_util.test_seed())  # pylint: disable=cell-var-from-loop

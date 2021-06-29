@@ -18,7 +18,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import functools
 import sys
 
 # Dependency imports
@@ -59,7 +58,7 @@ BATES_TOTAL_COUNT_STABILITY_LIMITS = {
 }
 
 
-class Bates(distribution.Distribution):
+class Bates(distribution.AutoCompositeTensorDistribution):
   """Bates distribution.
 
   The Bates distribution is the distribution of the average of `total_count`
@@ -117,10 +116,10 @@ class Bates(distribution.Distribution):
   Compute some values for the pdf.
 
   ```python
-  dist.probs(50.).eval()    # shape: [3]
+  dist.prob(50.)    # shape: [3]
   x = [[50., 50., 50.],
        [5., 10., 20.]]      # shape: [2, 3]
-  dist.probs(x).eval()      # shape: [2]
+  dist.prob(x)      # shape: [2, 3]
   ```
   """
 
@@ -180,12 +179,20 @@ class Bates(distribution.Distribution):
     return dict(
         total_count=parameter_properties.ParameterProperties(
             default_constraining_bijector_fn=parameter_properties
-            .BIJECTOR_NOT_IMPLEMENTED),
+            .BIJECTOR_NOT_IMPLEMENTED,
+            # The method `_sample_bates` currently constructs intermediate
+            # samples with a shape that depends on `total_count`, so, although
+            # `total_count` is not *inherently* a shape parameter, we annotate
+            # it as one in the current implementation (making it the rare case
+            # of a shape parameter that also has batch semantics). This could
+            # be removed if a different sampling method (eg, rejection sampling)
+            # were used.
+            specifies_shape=True),
         low=parameter_properties.ParameterProperties(),
         # TODO(b/169874884): Support decoupled parameterization.
         high=parameter_properties.ParameterProperties(
             default_constraining_bijector_fn=parameter_properties
-            .BIJECTOR_NOT_IMPLEMENTED,))
+            .BIJECTOR_NOT_IMPLEMENTED))
 
   @property
   def total_count(self):
@@ -206,16 +213,6 @@ class Bates(distribution.Distribution):
     return [('total_count', self._total_count),
             ('low', self._low),
             ('high', self._high)]
-
-  def _batch_shape_tensor(self):
-    return functools.reduce(
-        ps.broadcast_shape,
-        [ps.shape(param) for _, param in self._params_list()])
-
-  def _batch_shape(self):
-    return functools.reduce(
-        tf.broadcast_static_shape,
-        [param.shape for _, param in self._params_list()])
 
   def _event_shape_tensor(self):
     return tf.constant([], dtype=tf.int32)
@@ -238,7 +235,8 @@ class Bates(distribution.Distribution):
     return _bates_cdf(self.total_count, self.low, self.high, self.dtype, value)
 
   def _mean(self):
-    return (self.low + self.high) / 2.
+    return tf.broadcast_to(
+        (self.low + self.high) / 2., self._batch_shape_tensor())
 
   @distribution_util.AppendDocstring(
       'For `n = 1`, any value in `(low, high)` is a mode; this gives the mean.')
@@ -296,10 +294,6 @@ class Bates(distribution.Distribution):
           self.low, self.high, message='`low` must be less than `high`.'))
 
     return assertions
-
-  _composite_tensor_nonshape_params = ('low', 'high')
-
-  _composite_tensor_shape_params = ('total_count',)
 
 
 # TODO(b/157665707): Investigate alternative PDF formulas / computations.
@@ -489,6 +483,9 @@ def _segmented_range(limits):
   Returns:
     segments: 1D `Tensor` of segment ranges.
   """
+  # To cope with [0]-shaped limits, which disagrees with the sensibilities of
+  # tf.repeat, we left-pad, then slice the output.
+  limits = tf.pad(limits, [[1, 0]], constant_values=0)
   return (tf.range(tf.reduce_sum(limits)) -
           tf.repeat(tf.concat([[0], tf.cumsum(limits[:-1])], axis=0), limits))
 
@@ -505,7 +502,7 @@ def _sample_bates(total_count, low, high, n, seed=None):
     high: (Batches of) upper bounds of the `Uniform` variables to sample. Should
       be the same floating dtype as `low` and broadcastable to the batch shape.
     n: `int32` number of samples to generate.
-    seed: Random seed to pass to `Uniform` sampler.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
   Returns:
     samples: Samples of (batches of) the `Bates` variable.  Will have same dtype

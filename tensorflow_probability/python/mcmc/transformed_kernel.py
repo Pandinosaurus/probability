@@ -81,7 +81,9 @@ def make_transform_fn(bijector, direction):
     if len(bijector) != len(state_parts):
       raise ValueError('State has {} parts, but bijector has {}.'.format(
           len(state_parts), len(bijector)))
-    return [getattr(b, direction)(sp) for b, sp in zip(bijector, state_parts)]
+    transformed_parts = [
+        getattr(b, direction)(sp) for b, sp in zip(bijector, state_parts)]
+    return tf.nest.pack_sequence_as(state_parts, transformed_parts)
   return fn
 
 
@@ -151,7 +153,8 @@ def _update_target_log_prob(kernel, new_target_log_prob):
   kernel_stack = _make_kernel_stack(kernel)
   # Update to target_log_prob to `new_target_log_prob`.
   with deprecation.silence():
-    prev_kernel = kernel_stack.pop().copy(
+    prev_kernel = kernel_stack.pop()
+    prev_kernel = prev_kernel.copy(
         target_log_prob_fn=new_target_log_prob)
 
     # Propagate the change upwards by reconstructing wrapper kernels.
@@ -385,7 +388,7 @@ class TransformedTransitionKernel(kernel_base.TransitionKernel):
       previous_kernel_results: `collections.namedtuple` containing `Tensor`s
         representing values from previous calls to this function (or from the
         `bootstrap_results` function.)
-      seed: Optional, a seed for reproducible sampling.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
     Returns:
       next_state: Tensor or Python list of `Tensor`s representing the state(s)
@@ -397,8 +400,9 @@ class TransformedTransitionKernel(kernel_base.TransitionKernel):
     with tf.name_scope(mcmc_util.make_name(
         self.name, 'transformed_kernel', 'one_step')):
       inner_kwargs = {} if seed is None else dict(seed=seed)
+      transformed_prev_state = previous_kernel_results.transformed_state
       transformed_next_state, kernel_results = self._inner_kernel.one_step(
-          previous_kernel_results.transformed_state,
+          transformed_prev_state,
           previous_kernel_results.inner_results,
           **inner_kwargs)
       transformed_next_state_parts = (
@@ -410,6 +414,9 @@ class TransformedTransitionKernel(kernel_base.TransitionKernel):
       next_state = (
           next_state_parts if mcmc_util.is_list_like(transformed_next_state)
           else next_state_parts[0])
+      if mcmc_util.is_list_like(transformed_prev_state):
+        transformed_next_state = tf.nest.pack_sequence_as(
+            transformed_prev_state, transformed_next_state)
       kernel_results = TransformedTransitionKernelResults(
           transformed_state=transformed_next_state,
           inner_results=kernel_results)
@@ -472,14 +479,15 @@ class TransformedTransitionKernel(kernel_base.TransitionKernel):
         transformed_init_state_parts = (
             self._transform_target_support_to_unconstrained(init_state_parts))
         transformed_init_state = (
-            transformed_init_state_parts if mcmc_util.is_list_like(init_state)
+            tf.nest.pack_sequence_as(init_state, transformed_init_state_parts)
+            if mcmc_util.is_list_like(init_state)
             else transformed_init_state_parts[0])
       else:
         if mcmc_util.is_list_like(transformed_init_state):
-          transformed_init_state = [
-              tf.convert_to_tensor(s, name='transformed_init_state')
-              for s in transformed_init_state
-          ]
+          transformed_init_state = tf.nest.pack_sequence_as(
+              transformed_init_state,
+              [tf.convert_to_tensor(s, name='transformed_init_state')
+               for s in transformed_init_state])
         else:
           transformed_init_state = tf.convert_to_tensor(
               value=transformed_init_state, name='transformed_init_state')
@@ -488,3 +496,12 @@ class TransformedTransitionKernel(kernel_base.TransitionKernel):
           inner_results=self._inner_kernel.bootstrap_results(
               transformed_init_state))
       return kernel_results
+
+  @property
+  def experimental_shard_axis_names(self):
+    return self.inner_kernel.experimental_shard_axis_names
+
+  def experimental_with_shard_axes(self, shard_axis_names):
+    return self.copy(
+        inner_kernel=self.inner_kernel.experimental_with_shard_axes(
+            shard_axis_names))

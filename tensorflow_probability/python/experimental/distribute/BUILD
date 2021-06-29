@@ -14,6 +14,11 @@
 # ============================================================================
 # Description:
 #   Contains utilities for writing distributed TFP code.
+load(
+    "//tensorflow_probability/python:build_defs.bzl",
+    "multi_substrate_py_library",
+    "multi_substrate_py_test",
+)
 
 licenses(["notice"])
 
@@ -23,64 +28,36 @@ package(
     ],
 )
 
-py_library(
+multi_substrate_py_library(
     name = "distribute",
     srcs = ["__init__.py"],
-    srcs_version = "PY2AND3",
-    deps = [
-        ":distribute_lib",
-        ":joint_distribution",
-        ":sharded",
-    ],
-)
-
-py_library(
-    name = "distribute_lib",
-    srcs = ["distribute_lib.py"],
     srcs_version = "PY3",
     deps = [
-        # tensorflow dep,
+        ":joint_distribution",
+        ":sharded",
+        "//tensorflow_probability/python/internal:distribute_lib",
     ],
 )
 
-py_library(
+multi_substrate_py_library(
     name = "sharded",
     srcs = ["sharded.py"],
     deps = [
         # tensorflow dep,
-        "//tensorflow_probability/python/distributions:independent",
-        "//tensorflow_probability/python/distributions:sample",
-        "//tensorflow_probability/python/internal:prefer_static",
+        "//tensorflow_probability/python/distributions:distribution",
+        "//tensorflow_probability/python/distributions:log_prob_ratio",
+        "//tensorflow_probability/python/experimental/bijectors:sharded",
+        "//tensorflow_probability/python/internal:distribute_lib",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:samplers",
     ],
 )
 
-py_library(
-    name = "joint_distribution",
-    srcs = ["joint_distribution.py"],
-    deps = [
-        ":distribute_lib",
-        ":sharded",
-        # tensorflow dep,
-        "//tensorflow_probability/python/distributions",
-    ],
-)
-
-py_test(
-    name = "sharded_test",
-    srcs = ["sharded_test.py"],
-    python_version = "PY3",
-    deps = [
-        ":sharded",
-        # tensorflow dep,
-        "//tensorflow_probability",
-        "//tensorflow_probability/python/internal:test_util",
-    ],
-)
-
-py_test(
-    name = "joint_distribution_test",
-    srcs = ["joint_distribution_test.py"],
+multi_substrate_py_test(
+    name = "diagonal_mass_matrix_adaptation_test",
+    size = "large",
+    srcs = ["diagonal_mass_matrix_adaptation_test.py"],
+    disabled_substrates = ["numpy"],
     python_version = "PY3",
     deps = [
         ":joint_distribution",
@@ -88,19 +65,57 @@ py_test(
         # absl/testing:parameterized dep,
         # tensorflow dep,
         "//tensorflow_probability",
+        "//tensorflow_probability/python/internal:distribute_lib",
+        "//tensorflow_probability/python/internal:distribute_test_lib",
         "//tensorflow_probability/python/internal:test_util",
     ],
 )
 
-py_test(
-    name = "distribute_lib_test",
-    srcs = ["distribute_lib_test.py"],
-    python_version = "PY3",
-    srcs_version = "PY3",
+multi_substrate_py_library(
+    name = "joint_distribution",
+    srcs = ["joint_distribution.py"],
     deps = [
-        ":distribute_lib",
+        ":sharded",
+        # tensorflow dep,
+        "//tensorflow_probability/python/bijectors:identity",
+        "//tensorflow_probability/python/distributions",
+        "//tensorflow_probability/python/distributions:log_prob_ratio",
+        "//tensorflow_probability/python/internal:distribute_lib",
+        "//tensorflow_probability/python/internal:samplers",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "sharded_test",
+    size = "medium",
+    srcs = ["sharded_test.py"],
+    disabled_substrates = ["numpy"],
+    python_version = "PY3",
+    deps = [
+        ":sharded",
         # tensorflow dep,
         "//tensorflow_probability",
+        "//tensorflow_probability/python/internal:distribute_lib",
+        "//tensorflow_probability/python/internal:distribute_test_lib",
+        "//tensorflow_probability/python/internal:samplers",
+        "//tensorflow_probability/python/internal:test_util",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "joint_distribution_test",
+    size = "large",
+    srcs = ["joint_distribution_test.py"],
+    disabled_substrates = ["numpy"],
+    python_version = "PY3",
+    deps = [
+        ":joint_distribution",
+        ":sharded",
+        # absl/testing:parameterized dep,
+        # tensorflow dep,
+        "//tensorflow_probability",
+        "//tensorflow_probability/python/internal:distribute_test_lib",
+        "//tensorflow_probability/python/internal:samplers",
         "//tensorflow_probability/python/internal:test_util",
     ],
 )

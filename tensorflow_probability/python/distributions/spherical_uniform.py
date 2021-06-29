@@ -31,15 +31,15 @@ from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import reparameterization
-from tensorflow_probability.python.internal import samplers
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.internal import tensorshape_util
+from tensorflow_probability.python.random import random_ops
 
 
 __all__ = ['SphericalUniform']
 
 
-class SphericalUniform(distribution.Distribution):
+class SphericalUniform(distribution.AutoCompositeTensorDistribution):
   r"""The uniform distribution over unit vectors on `S^{n-1}`.
 
   The uniform distribution on the unit hypersphere `S^{n-1}` embedded in
@@ -129,7 +129,7 @@ class SphericalUniform(distribution.Distribution):
           name=name)
 
   @classmethod
-  def _params_event_ndims(cls):
+  def _parameter_properties(cls, dtype, num_classes=None):
     return dict()
 
   @property
@@ -164,11 +164,11 @@ class SphericalUniform(distribution.Distribution):
     return tf.fill(batch_shape, -log_nsphere_surface_area)
 
   def _sample_n(self, n, seed=None):
-    raw = samplers.normal(
-        shape=ps.concat([[n], self.batch_shape, [self.dimension]], axis=0),
-        seed=seed, dtype=self.dtype)
-    unit_norm = raw / tf.norm(raw, ord=2, axis=-1)[..., tf.newaxis]
-    return unit_norm
+    return random_ops.spherical_uniform(
+        shape=ps.concat([[n], self.batch_shape], axis=0),
+        dimension=self.dimension,
+        dtype=self.dtype,
+        seed=seed)
 
   def _entropy(self):
     log_nsphere_surface_area = (

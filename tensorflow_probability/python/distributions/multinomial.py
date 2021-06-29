@@ -55,7 +55,7 @@ fractional components, and such that
 with `self.probs` and `self.total_count`."""
 
 
-class Multinomial(distribution.Distribution):
+class Multinomial(distribution.AutoCompositeTensorDistribution):
   """Multinomial distribution.
 
   This Multinomial distribution is parameterized by `probs`, a (batch of)
@@ -235,16 +235,6 @@ class Multinomial(distribution.Distribution):
     """Input argument `probs`."""
     return self._probs
 
-  def _batch_shape_tensor(self):
-    return tf.broadcast_dynamic_shape(
-        tf.shape(self._probs if self._logits is None else self._logits)[:-1],
-        tf.shape(self.total_count))
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(
-        (self._probs if self._logits is None else self._logits).shape[:-1],
-        self.total_count.shape)
-
   def _event_shape_tensor(self):
     # We will never broadcast the num_categories with total_count.
     return tf.shape(self._probs if self._logits is None else self._logits)[-1:]
@@ -300,7 +290,7 @@ class Multinomial(distribution.Distribution):
   def _logits_parameter_no_checks(self):
     if self._logits is None:
       return tf.math.log(self._probs)
-    return tf.identity(self._logits)
+    return tensor_util.identity_as_tensor(self._logits)
 
   def probs_parameter(self, name=None):
     """Probs vec computed from non-`None` input arg (`probs` or `logits`)."""
@@ -309,7 +299,7 @@ class Multinomial(distribution.Distribution):
 
   def _probs_parameter_no_checks(self):
     if self._logits is None:
-      return tf.identity(self._probs)
+      return tensor_util.identity_as_tensor(self._probs)
     return tf.math.softmax(self._logits)
 
   def _default_event_space_bijector(self):
@@ -355,7 +345,7 @@ def draw_sample(num_samples, num_classes, logits, num_trials, dtype, seed):
     num_trials: Tensor of number of categorical trials each multinomial consists
       of.  num_trials[..., tf.newaxis] must broadcast with logits.
     dtype: dtype at which to emit samples.
-    seed: Random seed.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
   Returns:
     samples: Tensor of given dtype and shape [num_samples] + batch_shape +
@@ -385,7 +375,7 @@ def _sample_multinomial_as_iterated_binomial(
     num_trials: Tensor of number of categorical trials each multinomial consists
       of.  num_trials[..., tf.newaxis] must broadcast with probs.
     dtype: dtype at which to emit samples.
-    seed: Random seed.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
   Returns:
     samples: Tensor of given dtype and shape [num_samples] + batch_shape +
@@ -413,7 +403,7 @@ def _sample_multinomial_as_iterated_binomial(
 
     num_trials = tf.cast(num_trials, probs.dtype)
     # Pre-broadcast with probs
-    num_trials += tf.zeros_like(probs[..., 0])
+    num_trials = num_trials + tf.zeros_like(probs[..., 0])
     # Pre-enlarge for different output samples
     num_trials = _replicate_along_left(num_trials, num_samples)
     i = tf.constant(0)

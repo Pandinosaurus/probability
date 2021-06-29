@@ -25,17 +25,18 @@ import tensorflow.compat.v2 as tf
 from tensorflow_probability.python.bijectors import invert as invert_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.bijectors import weibull_cdf as weibull_cdf_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import kullback_leibler
 from tensorflow_probability.python.distributions import transformed_distribution
 from tensorflow_probability.python.distributions import uniform
 from tensorflow_probability.python.internal import assert_util
-from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
 
 
-class Weibull(transformed_distribution.TransformedDistribution):
+class Weibull(transformed_distribution.TransformedDistribution,
+              distribution.AutoCompositeTensorDistribution):
   """The Weibull distribution with 'concentration' and `scale` parameters.
 
   #### Mathematical details
@@ -83,7 +84,7 @@ class Weibull(transformed_distribution.TransformedDistribution):
   Example of initialization of a 3-batch of distributions with varying scales
   and concentrations.
 
-    ```python
+  ```python
   tfd = tfp.distributions
 
   # Define a 3-batch of Weibull distributions.
@@ -136,13 +137,10 @@ class Weibull(transformed_distribution.TransformedDistribution):
       self._weibull_bijector = weibull_cdf_bijector.WeibullCDF(
           scale=scale, concentration=concentration, validate_args=validate_args)
 
-      batch_shape = distribution_util.get_broadcast_shape(concentration, scale)
       super(Weibull, self).__init__(
           distribution=uniform.Uniform(
-              # TODO(b/137665504): Use batch-adding meta-distribution to set the
-              # batch shape instead of tf.ones.
-              low=tf.zeros(batch_shape, dtype=dtype),
-              high=tf.ones(batch_shape, dtype=dtype),
+              low=tf.zeros([], dtype=dtype),
+              high=tf.ones([], dtype=dtype),
               allow_nan_stats=allow_nan_stats),
           # The Weibull bijector encodes the CDF function as the forward,
           # and hence needs to be inverted.
@@ -172,6 +170,8 @@ class Weibull(transformed_distribution.TransformedDistribution):
   def scale(self):
     """Distribution parameter for scale."""
     return self._weibull_bijector.scale
+
+  experimental_is_sharded = False
 
   def _entropy(self):
     one = tf.constant(1., dtype=self.dtype)

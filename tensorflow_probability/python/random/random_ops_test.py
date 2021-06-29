@@ -87,7 +87,7 @@ class _RandomRayleigh(object):
     [x_, sample_mean_, sample_var_] = self.evaluate([
         x, sample_mean[..., 0], sample_var])
     self.assertAllEqual(final_shape_, x_.shape)
-    self.assertAllEqual(np.ones_like(x_, dtype=np.bool), x_ > 0.)
+    self.assertAllEqual(np.ones_like(x_, dtype=np.bool_), x_ > 0.)
     self.assertAllClose(np.sqrt(np.pi / 2.) * scale_, sample_mean_,
                         atol=0.05, rtol=0.)
     self.assertAllClose(0.5 * (4. - np.pi) * scale_**2., sample_var_,
@@ -155,7 +155,7 @@ class _RandomSphericalUniform(object):
     seed = test_util.test_seed()
     dimension = np.int32(10)
 
-    @tf.function(experimental_compile=True)
+    @tf.function(jit_compile=True)
     def sample():
       return tfp.random.spherical_uniform(
           dimension=dimension,

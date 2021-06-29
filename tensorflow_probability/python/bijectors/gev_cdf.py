@@ -21,8 +21,10 @@ from __future__ import print_function
 import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python.bijectors import bijector
+from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
 
 __all__ = [
@@ -30,7 +32,7 @@ __all__ = [
 ]
 
 
-class GeneralizedExtremeValueCDF(bijector.Bijector):
+class GeneralizedExtremeValueCDF(bijector.AutoCompositeTensorBijector):
   """Compute the GeneralizedExtremeValue CDF.
 
   Compute `Y = g(X) = exp(-t(X))`,
@@ -97,6 +99,17 @@ class GeneralizedExtremeValueCDF(bijector.Bijector):
           forward_min_event_ndims=0,
           parameters=parameters,
           name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict(
+        loc=parameter_properties.ParameterProperties(),
+        scale=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
+        concentration=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))))
 
   @property
   def loc(self):
@@ -184,11 +197,18 @@ class GeneralizedExtremeValueCDF(bijector.Bijector):
     concentration = (
         tf.convert_to_tensor(self.concentration) if concentration is None else
         concentration)
+    # We intentionally compute the boundary with (1.0 / concentration) * scale
+    # instead of just scale / concentration.
+    # Why?  The sampler returns loc + (foo / concentration) * scale,
+    # and at high-ish values of concentration, foo has a decent
+    # probability of being numerically exactly -1.  We therefore mimic
+    # the pattern of round-off that occurs in the sampler to make sure
+    # that samples emitted from this distribution will pass its own
+    # validations.  This is sometimes necessary: in TF's float32,
+    #   0.69314826 / 37.50019 < (1.0 / 37.50019) * 0.69314826
+    boundary = loc - (1.0 / concentration) * scale
     # The support of this bijector depends on the sign of concentration.
-    is_in_bounds = tf.where(
-        concentration > 0.,
-        x >= loc - scale / concentration,
-        x <= loc - scale / concentration)
+    is_in_bounds = tf.where(concentration > 0., x >= boundary, x <= boundary)
     # For concentration 0, the domain is the whole line.
     is_in_bounds = is_in_bounds | tf.math.equal(concentration, 0.)
 

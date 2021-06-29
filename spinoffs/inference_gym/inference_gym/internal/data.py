@@ -23,15 +23,18 @@ from inference_gym.internal.datasets import convection_lorenz_bridge as convecti
 from inference_gym.internal.datasets import sp500_closing_prices as sp500_closing_prices_lib
 from inference_gym.internal.datasets import synthetic_item_response_theory as synthetic_item_response_theory_lib
 from inference_gym.internal.datasets import synthetic_log_gaussian_cox_process as synthetic_log_gaussian_cox_process_lib
+from inference_gym.internal.datasets import synthetic_plasma_spectroscopy as synthetic_plasma_spectroscopy_lib
 
 __all__ = [
     'brownian_motion_missing_middle_observations',
     'convection_lorenz_bridge',
     'german_credit_numeric',
     'radon',
-    'sp500_closing_prices',
+    'sp500_returns',
+    'sp500_log_returns',
     'synthetic_item_response_theory',
     'synthetic_log_gaussian_cox_process',
+    'synthetic_plasma_spectroscopy',
 ]
 
 
@@ -425,8 +428,11 @@ def radon(
   )
 
 
-def sp500_closing_prices(num_points=None):
+def sp500_returns(num_points=None):
   """Dataset of mean-adjusted returns of the S&P 500 index.
+
+  The returns here are the absolute returns (current price minus previous
+  price).
 
   Each of the 2516 entries represents the adjusted return of the daily closing
   price relative to the previous close, for each (non-holiday) weekday,
@@ -441,6 +447,31 @@ def sp500_closing_prices(num_points=None):
       `centered_returns`: float `Tensor` daily returns, minus the mean return.
   """
   returns = np.diff(sp500_closing_prices_lib.CLOSING_PRICES)
+  num_points = num_points or len(returns)
+  return dict(
+      centered_returns=returns[-num_points:] - np.mean(returns[-num_points:]))
+
+
+def sp500_log_returns(num_points=None):
+  """Dataset of mean-adjusted log returns of the S&P 500 index.
+
+  A log return is the change in the log-transformed closing prices, which also
+  corresponds to the log of relative returns (current price divided by previous
+  price).
+
+  Each of the 2516 entries represents the adjusted log return of the daily
+  closing price relative to the previous close, for each (non-holiday) weekday,
+  beginning 6/26/2010 and ending 6/24/2020.
+
+  Args:
+    num_points: Optional `int` length of the series to return. If specified,
+      only the final `num_points` returns are centered and returned.
+      Default value: `None`.
+  Returns:
+    dataset: A Dict with the following keys:
+      `centered_returns`: float `Tensor` daily returns, minus the mean return.
+  """
+  returns = np.diff(np.log(sp500_closing_prices_lib.CLOSING_PRICES))
   num_points = num_points or len(returns)
   return dict(
       centered_returns=returns[-num_points:] - np.mean(returns[-num_points:]))
@@ -555,4 +586,23 @@ def synthetic_log_gaussian_cox_process(
       train_locations=locations,
       train_extents=extents,
       train_counts=counts,
+  )
+
+
+def synthetic_plasma_spectroscopy():
+  """Synthetic dataset sampled from the PlasmaSpectroscopy model.
+
+  Returns:
+    dataset: A Dict with the following keys:
+      measurements: Float `Tensor` with shape [num_wavelengths, num_sensors].
+        The spectrometer measurements.
+      wavelengths: Float `Tensor` with shape [num_wavelengths]. Wavelengths
+        measured by the spectrometers.
+      center_wavelength: Float `Tensor` scalar. The center wavelength of the
+        target emission line.
+  """
+  return dict(
+      measurements=synthetic_plasma_spectroscopy_lib.MEASUREMENTS,
+      wavelengths=synthetic_plasma_spectroscopy_lib.WAVELENGTHS,
+      center_wavelength=synthetic_plasma_spectroscopy_lib.CENTER_WAVELENGTH,
   )

@@ -19,15 +19,14 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import warnings
 
 # Dependency imports
 
 from absl.testing import parameterized
 import numpy as np
 import tensorflow.compat.v2 as tf
+from tensorflow_probability.python import bijectors as tfb
 from tensorflow_probability.python import distributions as tfd
-from tensorflow_probability.python.internal import samplers
 from tensorflow_probability.python.internal import test_util
 
 
@@ -272,6 +271,53 @@ class JointDistributionNamedTest(test_util.TestCase):
       lp_kwargs = d.log_prob(e, a, x)
 
   @parameterized.named_parameters(
+      ('_sample', lambda d, **kwargs: d.sample(**kwargs)),
+      ('_sample_and_log_prob',
+       lambda d, **kwargs: d.experimental_sample_and_log_prob(**kwargs)[0]),
+  )
+  def test_nested_partial_value(self, sample_fn):
+    innermost = tfd.JointDistributionNamed({
+        'a': tfd.Exponential(1.),
+        'b': lambda a: tfd.Sample(tfd.LogNormal(a, a), [5]),
+    })
+
+    inner = tfd.JointDistributionNamed({
+        'c': tfd.Exponential(1.),
+        'd': innermost,
+    })
+
+    outer = tfd.JointDistributionNamed({
+        'e': tfd.Exponential(1.),
+        'f': inner,
+    })
+
+    seed = test_util.test_seed(sampler_type='stateless')
+    true_xs = outer.sample(seed=seed)
+
+    def _update(dict_, **kwargs):
+      dict_.copy().update(**kwargs)
+      return dict_
+
+    # These asserts work because we advance the stateless seed inside the model
+    # whether or not a sample is actually generated.
+    partial_xs = _update(true_xs, f=None)
+    xs = sample_fn(outer, value=partial_xs, seed=seed)
+    self.assertAllCloseNested(true_xs, xs)
+
+    partial_xs = _update(true_xs, e=None)
+    xs = sample_fn(outer, value=partial_xs, seed=seed)
+    self.assertAllCloseNested(true_xs, xs)
+
+    partial_xs = _update(true_xs, f=_update(true_xs['f'], d=None))
+    xs = sample_fn(outer, value=partial_xs, seed=seed)
+    self.assertAllCloseNested(true_xs, xs)
+
+    partial_xs = _update(
+        true_xs, f=_update(true_xs['f'], d=_update(true_xs['f']['d'], a=None)))
+    xs = sample_fn(outer, value=partial_xs, seed=seed)
+    self.assertAllCloseNested(true_xs, xs)
+
+  @parameterized.named_parameters(
       ('basic', basic_ordered_model_fn),
       ('nested_lists', nested_lists_model_fn))
   def test_can_call_ordereddict_log_prob_with_args_and_kwargs(self, model_fn):
@@ -371,6 +417,21 @@ class JointDistributionNamedTest(test_util.TestCase):
         ValueError, 'Must pass probs or logits, but not both.'):
       tfd.JointDistributionNamed(dict(logits=tfd.Normal(0., 1.),
                                       x=tfd.Bernoulli))
+
+  def test_dist_fn_takes_kwargs(self):
+    dist = tfd.JointDistributionNamed(
+        {'positive': tfd.Exponential(rate=1.),
+         'negative': tfb.Scale(-1.)(tfd.Exponential(rate=1.)),
+         'b': lambda **kwargs: tfd.Normal(loc=kwargs['negative'],  # pylint: disable=g-long-lambda
+                                          scale=kwargs['positive'],
+                                          validate_args=True),
+         'a': lambda **kwargs: tfb.Scale(kwargs['b'])(  # pylint: disable=g-long-lambda
+             tfd.Gamma(concentration=-kwargs['negative'],
+                       rate=kwargs['positive'],
+                       validate_args=True))
+         }, validate_args=True)
+    lp = dist.log_prob(dist.sample(5, seed=test_util.test_seed()))
+    self.assertAllEqual(lp.shape, [5])
 
   def test_graph_resolution(self):
     # pylint: disable=bad-whitespace
@@ -488,32 +549,6 @@ class JointDistributionNamedTest(test_util.TestCase):
     lp = d.log_prob(x)
     self.assertEqual((2, 3), lp.shape)
 
-  def test_sample_shape_propagation_nondefault_behavior(self):
-    # pylint: disable=bad-whitespace
-    d = tfd.JointDistributionNamed(dict(
-        e    =          tfd.Independent(tfd.Exponential(rate=[100, 120]), 1),
-        scale=lambda e: tfd.Gamma(concentration=e[..., 0], rate=e[..., 1]),
-        s    =          tfd.HalfNormal(2.5),
-        loc  =lambda s: tfd.Normal(loc=0, scale=s),
-        df   =          tfd.Exponential(2),
-        x    =          tfd.StudentT),
-                                   validate_args=False)
-    # pylint: enable=bad-whitespace
-    # The following enables the nondefault sample shape behavior.
-    d._always_use_specified_sample_shape = True
-    sample_shape = (2, 3)
-    x = d.sample(sample_shape, seed=test_util.test_seed())
-    self.assertLen(x, 6)
-    self.assertEqual(sample_shape + (2,), x['e'].shape)
-    self.assertEqual(sample_shape * 2, x['scale'].shape)  # Has 1 arg.
-    self.assertEqual(sample_shape * 1, x['s'].shape)      # Has 0 args.
-    self.assertEqual(sample_shape * 2, x['loc'].shape)    # Has 1 arg.
-    self.assertEqual(sample_shape * 1, x['df'].shape)     # Has 0 args.
-    # Has 3 args, one being scalar.
-    self.assertEqual(sample_shape * 3, x['x'].shape)
-    lp = d.log_prob(x)
-    self.assertEqual(sample_shape * 3, lp.shape)
-
   def test_sample_complex_dependency(self):
     # pylint: disable=bad-whitespace
     d = tfd.JointDistributionNamed(
@@ -620,60 +655,6 @@ class JointDistributionNamedTest(test_util.TestCase):
     with self.assertRaisesRegex(
         ValueError, r'Supplied both `value` and keyword arguments .*'):
       joint.sample(seed=seed, a=1., value={'a': 1})
-
-  @test_util.jax_disable_test_missing_functionality('stateful samplers')
-  @test_util.numpy_disable_test_missing_functionality('stateful samplers')
-  def test_legacy_dists(self):
-
-    class StatefulNormal(tfd.Normal):
-
-      def _sample_n(self, n, seed=None):
-        return self.loc + self.scale * tf.random.normal(
-            tf.concat([[n], self.batch_shape_tensor()], axis=0),
-            seed=seed)
-
-    # pylint: disable=bad-whitespace
-    d = tfd.JointDistributionNamed(dict(
-        e    =          tfd.Independent(tfd.Exponential(rate=[100, 120]), 1),
-        loc  =          StatefulNormal(loc=0, scale=2.),
-        scale=lambda e: tfd.Gamma(concentration=e[..., 0], rate=e[..., 1]),
-        m    =          tfd.Normal,
-        x    =lambda m: tfd.Sample(tfd.Bernoulli(logits=m), 12)),
-                                   validate_args=True)
-    # pylint: enable=bad-whitespace
-
-    warnings.simplefilter('always')
-    with warnings.catch_warnings(record=True) as w:
-      d.sample(seed=test_util.test_seed())
-    self.assertRegexpMatches(
-        str(w[0].message),
-        r'Falling back to stateful sampling for.*of type.*StatefulNormal.*'
-        r'component name "loc" and `dist.name` "Normal"',
-        msg=w)
-
-  @test_util.jax_disable_test_missing_functionality('stateful samplers')
-  @test_util.numpy_disable_test_missing_functionality('stateful samplers')
-  def test_legacy_dists_stateless_seed_raises(self):
-
-    class StatefulNormal(tfd.Normal):
-
-      def _sample_n(self, n, seed=None):
-        return self.loc + self.scale * tf.random.normal(
-            tf.concat([[n], self.batch_shape_tensor()], axis=0),
-            seed=seed)
-
-    # pylint: disable=bad-whitespace
-    d = tfd.JointDistributionNamed(dict(
-        e    =          tfd.Independent(tfd.Exponential(rate=[100, 120]), 1),
-        loc  =          StatefulNormal(loc=0, scale=2.),
-        scale=lambda e: tfd.Gamma(concentration=e[..., 0], rate=e[..., 1]),
-        m    =          tfd.Normal,
-        x    =lambda m: tfd.Sample(tfd.Bernoulli(logits=m), 12)),
-                                   validate_args=True)
-    # pylint: enable=bad-whitespace
-
-    with self.assertRaisesRegexp(TypeError, r'Expected int for argument'):
-      d.sample(seed=samplers.zeros_seed())
 
 
 if __name__ == '__main__':

@@ -23,15 +23,18 @@ import collections
 import contextlib
 import functools
 import inspect
+import logging
 import types
-import decorator
 
+import decorator
 import six
 import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python.distributions import kullback_leibler
 from tensorflow_probability.python.distributions.internal import slicing
 from tensorflow_probability.python.internal import assert_util
+from tensorflow_probability.python.internal import auto_composite_tensor
+from tensorflow_probability.python.internal import batch_shape_lib
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import name_util
@@ -144,16 +147,6 @@ def _update_docstring(old_str, append_str):
 def _remove_dict_keys_with_value(dict_, val):
   """Removes `dict` keys which have have `self` as value."""
   return {k: v for k, v in dict_.items() if v is not val}
-
-
-def _cast_structure(value, structure):
-  """Cast a structure."""
-  if tf.nest.is_nested(structure):
-    if nest._is_namedtuple(structure):  # pylint: disable=protected-access
-      return type(structure)(*value)
-    else:
-      return type(structure)(value)
-  return value
 
 
 def _set_sample_static_shape_for_tensor(x,
@@ -283,7 +276,61 @@ class _DistributionMeta(abc.ABCMeta):
       return super(_DistributionMeta, mcs).__new__(
           mcs, classname, baseclasses, attrs)
 
+    # Warn when a subclass inherits `_parameter_properties` from its parent
+    # (this is unsafe, since the subclass will in general have different
+    # parameters). Exceptions are:
+    #  - Subclasses that don't define their own `__init__` (handled above by
+    #    the short-circuit when `default_init is None`).
+    #  - Subclasses that define a passthrough `__init__(self, *args, **kwargs)`.
     # pylint: disable=protected-access
+    init_argspec = tf_inspect.getfullargspec(default_init)
+    if ('_parameter_properties' not in attrs
+        # Passthrough exception: may only take `self` and at least one of
+        # `*args` and `**kwargs`.
+        and (len(init_argspec.args) > 1
+             or not (init_argspec.varargs or init_argspec.varkw))):
+
+      @functools.wraps(base._parameter_properties)
+      def wrapped_properties(*args, **kwargs):  # pylint: disable=missing-docstring
+        """Wrapper to warn if `parameter_properties` is inherited."""
+        properties = base._parameter_properties(*args, **kwargs)
+        # Warn *after* calling the base method, so that we don't bother warning
+        # if it just raised NotImplementedError anyway.
+        logging.warning("""
+Distribution subclass %s inherits `_parameter_properties from its parent (%s)
+while also redefining `__init__`. The inherited annotations cover the following
+parameters: %s. It is likely that these do not match the subclass parameters.
+This may lead to errors when computing batch shapes, slicing into batch
+dimensions, calling `.copy()`, flattening the distribution as a CompositeTensor
+(e.g., when it is passed or returned from a `tf.function`), and possibly other
+cases. The recommended pattern for distribution subclasses is to define a new
+`_parameter_properties` method with the subclass parameters, and to store the
+corresponding parameter values as `self._parameters` in `__init__`, after
+calling the superclass constructor:
+
+```
+class MySubclass(tfd.SomeDistribution):
+
+  def __init__(self, param_a, param_b):
+    parameters = dict(locals())
+    # ... do subclass initialization ...
+    super(MySubclass, self).__init__(**base_class_params)
+    # Ensure that the subclass (not base class) parameters are stored.
+    self._parameters = parameters
+
+  def _parameter_properties(self, dtype, num_classes=None):
+    return dict(
+      # Annotations may optionally specify properties, such as `event_ndims`,
+      # `default_constraining_bijector_fn`, `specifies_shape`, etc.; see
+      # the `ParameterProperties` documentation for details.
+      param_a=tfp.util.ParameterProperties(),
+      param_b=tfp.util.ParameterProperties())
+```
+""", classname, base.__name__, str(properties.keys()))
+        return properties
+
+      attrs['_parameter_properties'] = wrapped_properties
+
     # For a comparison of different methods for wrapping functions, see:
     # https://hynek.me/articles/decorators/
     @decorator.decorator
@@ -322,7 +369,8 @@ class _DistributionMeta(abc.ABCMeta):
       return
     def flatten(dist):
       param_names = set(dist._composite_tensor_nonshape_params)  # pylint: disable=protected-access
-      components = {param_name: value for param_name, value
+      components = {param_name: getattr(
+          dist, param_name, value) for param_name, value
                     in dist.parameters.items() if param_name in param_names}
       metadata = {param_name: value for param_name, value
                   in dist.parameters.items() if param_name not in param_names}
@@ -330,6 +378,16 @@ class _DistributionMeta(abc.ABCMeta):
         keys, values = zip(*sorted(components.items()))
       else:
         keys, values = (), ()
+      # Mimics the logic in `tfp.experimental.composite_tensor` where we
+      # aggressively try to convert arguments into Tensors.
+      def _maybe_convert_to_tensor(value, name):
+        try:
+          value = tf.convert_to_tensor(value, name=name)
+        except (ValueError, TypeError, AssertionError):
+          pass
+        return value
+      values = tuple([_maybe_convert_to_tensor(value, name) for value, name,
+                      in zip(values, keys)])
       return values, (keys, metadata)
     def unflatten(info, xs):
       keys, metadata = info
@@ -366,6 +424,38 @@ class Distribution(_BaseDistribution):
   docstring. This is implemented as a simple decorator to avoid python
   linter complaining about missing Args/Returns/Raises sections in the
   partial docstrings.
+
+  TFP methods generally assume that Distribution subclasses implement at least
+  the following methods:
+  - `_sample_n`.
+  - `_log_prob` or `_prob`.
+  - `_event_shape` and `_event_shape_tensor`.
+  - `_parameter_properties` OR `_batch_shape` and `_batch_shape_tensor`.
+
+  Batch shape methods can be automatically derived from `parameter_properties`
+  in most cases, so it's usually not necessary to implement them directly.
+  Exceptions include Distributions that accept non-Tensor parameters (for
+  example, a distribution parameterized by a callable), or that have nonstandard
+  batch semantics (for example, `BatchReshape`).
+
+  Some functionality may depend on implementing additional methods. It is common
+  for Distribution subclasses to implement:
+
+  - Relevant statistics, such as `_mean`, `_mode`, `_variance` and/or `_stddev`.
+  - At least one of `_log_cdf`, `_cdf`, `_survival_function`, or
+    `_log_survival_function`.
+  - `_quantile`.
+  - `_entropy`.
+  - `_default_event_space_bijector`.
+  - `_parameter_properties` (to support automatic batch shape derivation,
+    batch slicing and other features).
+  - `_sample_and_log_prob`.
+
+  Note that subclasses of existing Distributions that redefine `__init__` do
+  *not* automatically inherit
+  `_parameter_properties` annotations from their parent: the subclass must
+  explicitly implement its own `_parameter_properties` method to support the
+  features, such as batch slicing, that this enables.
 
   #### Broadcasting, batching, and shapes
 
@@ -459,11 +549,11 @@ class Distribution(_BaseDistribution):
 
   # Will raise exception if ANY batch member has a < 1 or b < 1.
   dist = distributions.beta(a, b, allow_nan_stats=False)
-  mode = dist.mode().eval()
+  mode = dist.mode()
 
   # Will return NaN for batch members with either a < 1 or b < 1.
   dist = distributions.beta(a, b, allow_nan_stats=True)  # Default behavior
-  mode = dist.mode().eval()
+  mode = dist.mode()
   ```
 
   In all cases, an exception is raised if *invalid* parameters are passed, e.g.
@@ -472,7 +562,7 @@ class Distribution(_BaseDistribution):
   # Will raise an exception if any Op is run.
   negative_a = -1.0 * a  # beta distribution by definition has a > 0.
   dist = distributions.beta(negative_a, b, allow_nan_stats=True)
-  dist.mean().eval()
+  dist.mean()
   ```
 
   """
@@ -534,9 +624,16 @@ class Distribution(_BaseDistribution):
     self._parameters = self._no_dependency(parameters)
     self._parameters_sanitized = False
     self._graph_parents = graph_parents
-    self._initial_parameter_control_dependencies = tuple(
-        d for d in self._parameter_control_dependencies(is_init=True)
-        if d is not None)
+    self._defer_all_assertions = (
+        auto_composite_tensor.is_deferred_assertion_context())
+
+    if not self._defer_all_assertions:
+      self._initial_parameter_control_dependencies = tuple(
+          d for d in self._parameter_control_dependencies(is_init=True)
+          if d is not None)
+    else:
+      self._initial_parameter_control_dependencies = ()
+
     if self._initial_parameter_control_dependencies:
       self._initial_parameter_control_dependencies = (
           tf.group(*self._initial_parameter_control_dependencies),)
@@ -562,7 +659,8 @@ class Distribution(_BaseDistribution):
     identifies the keys of parameters that are expected to be tensors, except
     those that are shape-related.
     """
-    return tuple(self._params_event_ndims().keys())
+    return tuple(k for k, v in self.parameter_properties().items()
+                 if not v.specifies_shape)
 
   @property
   def _composite_tensor_shape_params(self):
@@ -575,12 +673,13 @@ class Distribution(_BaseDistribution):
     tensors, so that they can be collected appropriately in CompositeTensor but
     not in JAX applications.
     """
-    return ()
+    return tuple(k for k, v in self.parameter_properties().items()
+                 if v.specifies_shape)
 
   @classmethod
   def _parameter_properties(cls, dtype, num_classes=None):
     raise NotImplementedError(
-        '_parameter_properties` is not implemented: {}'.format(cls.__name__))
+        '_parameter_properties` is not implemented: {}.'.format(cls.__name__))
 
   @classmethod
   def parameter_properties(cls, dtype=tf.float32, num_classes=None):
@@ -588,6 +687,24 @@ class Distribution(_BaseDistribution):
 
     This dict should include an entry for each of the distribution's
     `Tensor`-valued constructor arguments.
+
+    Distribution subclasses are not required to implement
+    `_parameter_properties`, so this method may raise `NotImplementedError`.
+    Providing a `_parameter_properties` implementation enables several advanced
+    features, including:
+      - Distribution batch slicing (`sliced_distribution = distribution[i:j]`).
+      - Automatic inference of `_batch_shape` and
+        `_batch_shape_tensor`, which must otherwise be computed explicitly.
+      - Automatic instantiation of the distribution within TFP's internal
+        property tests.
+      - Automatic construction of 'trainable' instances of the distribution
+        using appropriate bijectors to avoid violating parameter constraints.
+        This enables the distribution family to be used easily as a
+        surrogate posterior in variational inference.
+
+    In the future, parameter property annotations may enable additional
+    functionality; for example, returning Distribution instances from
+    `tf.vectorized_map`.
 
     Args:
       dtype: Optional float `dtype` to assume for continuous-valued parameters.
@@ -603,6 +720,9 @@ class Distribution(_BaseDistribution):
         `str -> `tfp.python.internal.parameter_properties.ParameterProperties`
         dict mapping constructor argument names to `ParameterProperties`
         instances.
+    Raises:
+      NotImplementedError: if the distribution class does not implement
+        `_parameter_properties`.
     """
     with tf.name_scope('parameter_properties'):
       return cls._parameter_properties(dtype, num_classes=num_classes)
@@ -699,10 +819,13 @@ class Distribution(_BaseDistribution):
           k: v for k, v in p.items()
           if not k.startswith('__') and v is not self})
       self._parameters_sanitized = True
-    return dict(self._parameters)
+    # In some situations, the Distribution metaclass logic defers the evaluation
+    # of parameters, but at this point we actually want to evaluate the
+    # parameters.
+    return dict(
+        self._parameters() if callable(self._parameters) else self._parameters)
 
-  @classmethod
-  def _params_event_ndims(cls):
+  def _params_event_ndims(self):
     """Returns a dict mapping constructor argument names to per-event rank.
 
     The ranks are pulled from `cls.parameter_properties()`; this is a
@@ -712,14 +835,17 @@ class Distribution(_BaseDistribution):
       params_event_ndims: Per-event parameter ranks, a `str->int dict`.
     """
     try:
-      return {
-          k: param.event_ndims
-          for (k, param) in cls.parameter_properties().items()
-      }
+      properties = type(self).parameter_properties()
     except NotImplementedError:
       raise NotImplementedError(
           '{} does not support batch slicing; must implement '
-          '_parameter_properties.'.format(cls))
+          '_parameter_properties.'.format(type(self)))
+    params_event_ndims = {}
+    for (k, param) in properties.items():
+      ndims = param.instance_event_ndims(self)
+      if param.is_tensor and ndims is not None:
+        params_event_ndims[k] = ndims
+    return params_event_ndims
 
   def __getitem__(self, slices):
     """Slices the batch axes of this distribution, returning a new instance.
@@ -787,6 +913,11 @@ class Distribution(_BaseDistribution):
     """Python `bool` indicating possibly expensive checks are enabled."""
     return self._validate_args
 
+  @property
+  def experimental_shard_axis_names(self):
+    """The list or structure of lists of active shard axis names."""
+    return []
+
   def copy(self, **override_parameters_kwargs):
     """Creates a deep copy of the distribution.
 
@@ -809,17 +940,50 @@ class Distribution(_BaseDistribution):
       return slicing.batch_slice(self, self._params_event_ndims(),
                                  override_parameters_kwargs, Ellipsis)
     except NotImplementedError:
-      parameters = dict(self.parameters, **override_parameters_kwargs)
-      d = type(self)(**parameters)
-      # pylint: disable=protected-access
-      d._parameters = parameters
-      d._parameters_sanitized = True
-      # pylint: enable=protected-access
-      return d
+      pass
+    parameters = dict(self.parameters, **override_parameters_kwargs)
+    d = type(self)(**parameters)
+    # pylint: disable=protected-access
+    d._parameters = self._no_dependency(parameters)
+    d._parameters_sanitized = True
+    # pylint: enable=protected-access
+    return d
 
-  def _batch_shape_tensor(self):
-    raise NotImplementedError(
-        'batch_shape_tensor is not implemented: {}'.format(type(self).__name__))
+  def _batch_shape_tensor(self, **parameter_kwargs):
+    """Infers batch shape from parameters.
+
+    The overall batch shape is inferred by broadcasting the batch shapes of
+    all parameters,
+
+    ```python
+    parameter_batch_shapes = []
+    for name, properties in self.parameter_properties.items():
+      parameter = self.parameters[name]
+      parameter_batch_shapes.append(
+        base_shape(parameter)[:-properties.instance_event_ndims(parameter)])
+    ```
+
+    where a parameter's `base_shape` is its batch shape if it
+    defines one (e.g., if it is a Distribution, LinearOperator, etc.), and its
+    Tensor shape otherwise. Parameters with structured batch shape
+    (in particular, non-autobatched JointDistributions) are not currently
+    supported.
+
+    Args:
+      **parameter_kwargs: Optional keyword arguments overriding the parameter
+        values in `self.parameters`. Typically this is used to avoid multiple
+        Tensor conversions of the same value.
+    Returns:
+      batch_shape_tensor: `Tensor` broadcast batch shape of all parameters.
+    """
+    try:
+      return batch_shape_lib.inferred_batch_shape_tensor(
+          self, **parameter_kwargs)
+    except NotImplementedError:
+      raise NotImplementedError('Cannot compute batch shape of distribution '
+                                '{}: you must implement at least one of '
+                                '`_batch_shape_tensor` or '
+                                '`_parameter_properties`.'.format(self))
 
   def batch_shape_tensor(self, name='batch_shape_tensor'):
     """Shape of a single sample from a single event index as a 1-D `Tensor`.
@@ -862,7 +1026,35 @@ class Distribution(_BaseDistribution):
           batch_shape, check_types=False)
 
   def _batch_shape(self):
-    return None
+    """Infers static batch shape from parameters.
+
+    The overall batch shape is inferred by broadcasting the batch shapes of
+    all parameters
+
+    ```python
+    parameter_batch_shapes = []
+    for name, properties in self.parameter_properties.items():
+      parameter = self.parameters[name]
+      parameter_batch_shapes.append(
+        base_shape(parameter)[:-properties.instance_event_ndims(parameter)])
+    ```
+
+    where a parameter's `base_shape` is its batch shape if it
+    defines one (e.g., if it is a Distribution, LinearOperator, etc.), and its
+    Tensor shape otherwise. Distributions with structured batch shape
+    (in particular, non-autobatched JointDistributions) are not currently
+    supported.
+
+    Returns:
+      batch_shape: `tf.TensorShape` broadcast batch shape of all parameters; may
+        be partially defined or unknown.
+    """
+    try:
+      return batch_shape_lib.inferred_batch_shape(self)
+    except NotImplementedError:
+      # If a distribution doesn't implement `_parameter_properties` or its own
+      # `_batch_shape` method, we can only return the most general shape.
+      return tf.TensorShape(None)
 
   @property
   def batch_shape(self):
@@ -876,16 +1068,25 @@ class Distribution(_BaseDistribution):
     Returns:
       batch_shape: `TensorShape`, possibly unknown.
     """
-    batch_shape = self._batch_shape()
-    # See comment in `batch_shape_tensor()` on structured batch shapes. If
-    # `_batch_shape()` is a `tf.TensorShape` instance or a flat list/tuple that
-    # does not contain `tf.TensorShape`s, we infer that it is not structured.
-    if (isinstance(batch_shape, tf.TensorShape)
-        or all(len(path) == 1 and not isinstance(s, tf.TensorShape)
-               for path, s in nest.flatten_with_tuple_paths(batch_shape))):
-      return tf.TensorShape(batch_shape)
-    return nest.map_structure_up_to(
-        self.dtype, tf.TensorShape, batch_shape, check_types=False)
+    if not hasattr(self, '__cached_batch_shape'):
+      # Cache the batch shape so that it's only inferred once. This is safe
+      # because runtime changes to parameter shapes can only affect
+      # `batch_shape_tensor`, never `batch_shape`.
+      batch_shape = self._batch_shape()
+
+      # See comment in `batch_shape_tensor()` on structured batch shapes. If
+      # `_batch_shape()` is a `tf.TensorShape` instance or a flat list/tuple
+      # that does not contain `tf.TensorShape`s, we infer that it is not
+      # structured.
+      if (isinstance(batch_shape, tf.TensorShape)
+          or all(len(path) == 1 and not isinstance(s, tf.TensorShape)
+                 for path, s in nest.flatten_with_tuple_paths(batch_shape))):
+        batch_shape = tf.TensorShape(batch_shape)
+      else:
+        batch_shape = nest.map_structure_up_to(
+            self.dtype, tf.TensorShape, batch_shape, check_types=False)
+      self.__cached_batch_shape = self._no_dependency(batch_shape)
+    return self.__cached_batch_shape
 
   def _event_shape_tensor(self):
     raise NotImplementedError(
@@ -966,22 +1167,21 @@ class Distribution(_BaseDistribution):
     raise NotImplementedError('sample_n is not implemented: {}'.format(
         type(self).__name__))
 
-  def _call_sample_n(self, sample_shape, seed, name, **kwargs):
+  def _call_sample_n(self, sample_shape, seed, **kwargs):
     """Wrapper around _sample_n."""
-    with self._name_and_control_scope(name):
-      if JAX_MODE and seed is None:
-        raise ValueError('Must provide JAX PRNGKey as `dist.sample(seed=.)`')
-      sample_shape = ps.convert_to_shape_tensor(
-          ps.cast(sample_shape, tf.int32), name='sample_shape')
-      sample_shape, n = self._expand_sample_shape_to_vector(
-          sample_shape, 'sample_shape')
-      samples = self._sample_n(
-          n, seed=seed() if callable(seed) else seed, **kwargs)
-      batch_event_shape = ps.shape(samples)[1:]
-      final_shape = ps.concat([sample_shape, batch_event_shape], 0)
-      samples = tf.reshape(samples, final_shape)
-      samples = self._set_sample_static_shape(samples, sample_shape)
-      return samples
+    if JAX_MODE and seed is None:
+      raise ValueError('Must provide JAX PRNGKey as `dist.sample(seed=.)`')
+    sample_shape = ps.convert_to_shape_tensor(
+        ps.cast(sample_shape, tf.int32), name='sample_shape')
+    sample_shape, n = self._expand_sample_shape_to_vector(
+        sample_shape, 'sample_shape')
+    samples = self._sample_n(
+        n, seed=seed() if callable(seed) else seed, **kwargs)
+    batch_event_shape = ps.shape(samples)[1:]
+    final_shape = ps.concat([sample_shape, batch_event_shape], 0)
+    samples = tf.reshape(samples, final_shape)
+    samples = self._set_sample_static_shape(samples, sample_shape)
+    return samples
 
   def sample(self, sample_shape=(), seed=None, name='sample', **kwargs):
     """Generate samples of the specified shape.
@@ -991,18 +1191,73 @@ class Distribution(_BaseDistribution):
 
     Args:
       sample_shape: 0D or 1D `int32` `Tensor`. Shape of the generated samples.
-      seed: Python integer or `tfp.util.SeedStream` instance, for seeding PRNG.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
       name: name to give to the op.
       **kwargs: Named arguments forwarded to subclass implementation.
 
     Returns:
       samples: a `Tensor` with prepended dimensions `sample_shape`.
     """
-    return self._call_sample_n(sample_shape, seed, name, **kwargs)
+    with self._name_and_control_scope(name):
+      return self._call_sample_n(sample_shape, seed, **kwargs)
+
+  def _call_sample_and_log_prob(self, sample_shape, seed, **kwargs):
+    """Wrapper around `_sample_and_log_prob`."""
+    if hasattr(self, '_sample_and_log_prob'):
+      sample_shape = ps.convert_to_shape_tensor(
+          ps.cast(sample_shape, tf.int32), name='sample_shape')
+      return self._sample_and_log_prob(
+          distribution_util.expand_to_vector(
+              sample_shape, tensor_name='sample_shape'),
+          seed=seed, **kwargs)
+
+    # Naive default implementation. This calls private, rather than public,
+    # methods, to avoid duplicating the name_and_control_scope.
+    value = self._call_sample_n(sample_shape, seed=seed, **kwargs)
+    if hasattr(self, '_log_prob'):
+      log_prob = self._log_prob(value, **kwargs)
+    elif hasattr(self, '_prob'):
+      log_prob = tf.math.log(self._prob(value, **kwargs))
+    else:
+      raise NotImplementedError('log_prob is not implemented: {}'.format(
+          type(self).__name__))
+    return value, log_prob
+
+  def experimental_sample_and_log_prob(self, sample_shape=(), seed=None,
+                                       name='sample_and_log_prob', **kwargs):
+    """Samples from this distribution and returns the log density of the sample.
+
+    The default implementation simply calls `sample` and `log_prob`:
+
+    ```
+    def _sample_and_log_prob(self, sample_shape, seed, **kwargs):
+      x = self.sample(sample_shape=sample_shape, seed=seed, **kwargs)
+      return x, self.log_prob(x, **kwargs)
+    ```
+
+    However, some subclasses may provide more efficient and/or numerically
+    stable implementations.
+
+    Args:
+      sample_shape: integer `Tensor` desired shape of samples to draw.
+        Default value: `()`.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
+        Default value: `None`.
+      name: name to give to the op.
+        Default value: `'sample_and_log_prob'`.
+      **kwargs: Named arguments forwarded to subclass implementation.
+    Returns:
+      samples: a `Tensor`, or structure of `Tensor`s, with prepended dimensions
+        `sample_shape`.
+      log_prob: a `Tensor` of shape `sample_shape(x) + self.batch_shape` with
+        values of type `self.dtype`.
+    """
+    with self._name_and_control_scope(name):
+      return self._call_sample_and_log_prob(sample_shape, seed=seed, **kwargs)
 
   def _call_log_prob(self, value, name, **kwargs):
     """Wrapper around _log_prob."""
-    value = _cast_structure(value, self.dtype)
+    value = nest_util.cast_structure(value, self.dtype)
     value = nest_util.convert_to_nested_tensor(
         value, name='value', dtype_hint=self.dtype,
         allow_packing=True)
@@ -1030,7 +1285,7 @@ class Distribution(_BaseDistribution):
 
   def _call_prob(self, value, name, **kwargs):
     """Wrapper around _prob."""
-    value = _cast_structure(value, self.dtype)
+    value = nest_util.cast_structure(value, self.dtype)
     value = nest_util.convert_to_nested_tensor(
         value, name='value', dtype_hint=self.dtype,
         allow_packing=True)
@@ -1056,9 +1311,51 @@ class Distribution(_BaseDistribution):
     """
     return self._call_prob(value, name, **kwargs)
 
+  def _call_unnormalized_log_prob(self, value, name, **kwargs):
+    """Wrapper around _unnormalized_log_prob."""
+    value = nest_util.cast_structure(value, self.dtype)
+    value = nest_util.convert_to_nested_tensor(
+        value, name='value', dtype_hint=self.dtype, allow_packing=True)
+    with self._name_and_control_scope(name, value, kwargs):
+      if hasattr(self, '_unnormalized_log_prob'):
+        return self._unnormalized_log_prob(value, **kwargs)
+      if hasattr(self, '_unnormalized_prob'):
+        return tf.math.log(self._unnormalized_prob(value, **kwargs))
+      if hasattr(self, '_log_prob'):
+        return self._log_prob(value, **kwargs)
+      if hasattr(self, '_prob'):
+        return tf.math.log(self._prob(value, **kwargs))
+      raise NotImplementedError(
+          'unnormalized_log_prob is not implemented: {}'.format(
+              type(self).__name__))
+
+  def unnormalized_log_prob(self,
+                            value,
+                            name='unnormalized_log_prob',
+                            **kwargs):
+    """Potentially unnormalized log probability density/mass function.
+
+    This function is similar to `log_prob`, but does not require that the
+    return value be normalized.  (Normalization here refers to the total
+    integral of probability being one, as it should be by definition for any
+    probability distribution.)  This is useful, for example, for distributions
+    where the normalization constant is difficult or expensive to compute.  By
+    default, this simply calls `log_prob`.
+
+    Args:
+      value: `float` or `double` `Tensor`.
+      name: Python `str` prepended to names of ops created by this function.
+      **kwargs: Named arguments forwarded to subclass implementation.
+
+    Returns:
+      unnormalized_log_prob: a `Tensor` of shape
+        `sample_shape(x) + self.batch_shape` with values of type `self.dtype`.
+    """
+    return self._call_unnormalized_log_prob(value, name, **kwargs)
+
   def _call_log_cdf(self, value, name, **kwargs):
     """Wrapper around _log_cdf."""
-    value = _cast_structure(value, self.dtype)
+    value = nest_util.cast_structure(value, self.dtype)
     value = nest_util.convert_to_nested_tensor(
         value, name='value', dtype_hint=self.dtype,
         allow_packing=True)
@@ -1096,7 +1393,7 @@ class Distribution(_BaseDistribution):
 
   def _call_cdf(self, value, name, **kwargs):
     """Wrapper around _cdf."""
-    value = _cast_structure(value, self.dtype)
+    value = nest_util.cast_structure(value, self.dtype)
     value = nest_util.convert_to_nested_tensor(
         value, name='value', dtype_hint=self.dtype,
         allow_packing=True)
@@ -1135,7 +1432,7 @@ class Distribution(_BaseDistribution):
 
   def _call_log_survival_function(self, value, name, **kwargs):
     """Wrapper around _log_survival_function."""
-    value = _cast_structure(value, self.dtype)
+    value = nest_util.cast_structure(value, self.dtype)
     value = nest_util.convert_to_nested_tensor(
         value, name='value', dtype_hint=self.dtype,
         allow_packing=True)
@@ -1181,7 +1478,7 @@ class Distribution(_BaseDistribution):
 
   def _call_survival_function(self, value, name, **kwargs):
     """Wrapper around _survival_function."""
-    value = _cast_structure(value, self.dtype)
+    value = nest_util.cast_structure(value, self.dtype)
     value = nest_util.convert_to_nested_tensor(
         value, name='value', dtype_hint=self.dtype,
         allow_packing=True)
@@ -1301,7 +1598,7 @@ class Distribution(_BaseDistribution):
         return self._variance(**kwargs)
       except NotImplementedError:
         try:
-          return tf.square(self._stddev(**kwargs))
+          return tf.nest.map_structure(tf.square, self._stddev(**kwargs))
         except NotImplementedError:
           pass
         raise
@@ -1336,7 +1633,7 @@ class Distribution(_BaseDistribution):
         return self._stddev(**kwargs)
       except NotImplementedError:
         try:
-          return tf.sqrt(self._variance(**kwargs))
+          return tf.nest.map_structure(tf.sqrt, self._variance(**kwargs))
         except NotImplementedError:
           pass
         raise
@@ -1465,12 +1762,6 @@ class Distribution(_BaseDistribution):
         '_default_event_space_bijector` is not implemented: {}'.format(
             type(self).__name__))
 
-  @deprecation.deprecated(
-      '2020-10-20',
-      'Use `experimental_default_event_space_bijector` instead.')
-  def _experimental_default_event_space_bijector(self, *args, **kwargs):
-    return self.experimental_default_event_space_bijector(*args, **kwargs)
-
   def experimental_default_event_space_bijector(self, *args, **kwargs):
     """Bijector mapping the reals (R**n) to the event space of the distribution.
 
@@ -1546,7 +1837,10 @@ class Distribution(_BaseDistribution):
     with tf.name_scope(self.name):
       with tf.name_scope(name) as name_scope:
         deps = []
-        deps.extend(self._initial_parameter_control_dependencies)
+        if self._defer_all_assertions:
+          deps.extend(self._parameter_control_dependencies(is_init=True))
+        else:
+          deps.extend(self._initial_parameter_control_dependencies)
         deps.extend(self._parameter_control_dependencies(is_init=False))
         if value is not UNSET_VALUE:
           deps.extend(self._sample_control_dependencies(
@@ -1554,6 +1848,13 @@ class Distribution(_BaseDistribution):
         if not deps:
           yield name_scope
           return
+        # In eager mode, some `assert_util.assert_xyz` calls return None. If a
+        # Distribution is created in eager mode with `validate_args=True`, then
+        # used in a `tf.function` context, it can result in errors when
+        # `tf.convert_to_tensor` is called on the inputs to
+        # `tf.control_dependencies` below. To avoid these errors, we drop the
+        # `None`s here.
+        deps = [x for x in deps if x is not None]
         with tf.control_dependencies(deps) as deps_scope:
           yield deps_scope
 
@@ -1623,6 +1924,48 @@ class Distribution(_BaseDistribution):
         take distribution samples as input.
     """
     return ()
+
+
+class _AutoCompositeTensorDistributionMeta(_DistributionMeta):
+  """Metaclass for `AutoCompositeTensorBijector`."""
+
+  def __new__(mcs, classname, baseclasses, attrs):  # pylint: disable=bad-mcs-classmethod-argument
+    """Give subclasses their own type_spec, not an inherited one."""
+
+    cls = super(_AutoCompositeTensorDistributionMeta, mcs).__new__(  # pylint: disable=too-many-function-args
+        mcs, classname, baseclasses, attrs)
+    if 'tensorflow_probability.python.distributions' in cls.__module__:
+      module_name = 'tfp.distributions'
+    elif ('tensorflow_probability.python.experimental.distributions'
+          in cls.__module__):
+      module_name = 'tfp.experimental.distributions'
+    else:
+      module_name = cls.__module__
+    return auto_composite_tensor.auto_composite_tensor(
+        cls,
+        omit_kwargs=('parameters',),
+        non_identifying_kwargs=('name',),
+        module_name=module_name)
+
+
+class AutoCompositeTensorDistribution(
+    Distribution, auto_composite_tensor.AutoCompositeTensor,
+    metaclass=_AutoCompositeTensorDistributionMeta):
+  r"""Base for `CompositeTensor` bijectors with auto-generated `TypeSpec`s.
+
+  `CompositeTensor` objects are able to pass in and out of `tf.function` and
+  `tf.while_loop`, or serve as part of the signature of a TF saved model.
+  `Distribution` subclasses that follow the contract of
+  `tfp.experimental.auto_composite_tensor` may be defined as `CompositeTensor`s
+  by inheriting from `AutoCompositeTensorDistribution`:
+
+  ```python
+  class MyDistribution(tfb.AutoCompositeTensorDistribution):
+
+    # The remainder of the subclass implementation is unchanged.
+  ```
+  """
+  pass
 
 
 class _PrettyDict(dict):

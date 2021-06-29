@@ -26,7 +26,14 @@ from absl.testing import parameterized
 import tensorflow.compat.v2 as tf
 
 import tensorflow_probability as tfp
+from tensorflow_probability.python.internal import distribute_lib
+from tensorflow_probability.python.internal import distribute_test_lib
+from tensorflow_probability.python.internal import samplers
 from tensorflow_probability.python.internal import test_util
+from tensorflow_probability.python.internal import unnest
+
+JAX_MODE = False
+
 
 tfb = tfp.bijectors
 tfd = tfp.distributions
@@ -62,6 +69,8 @@ RunHMCResults = collections.namedtuple('RunHMCResults', [
 
 def _make_composite_tensor(dist):
   """Wrapper to make distributions of linear operators composite."""
+  if JAX_MODE:
+    return dist
   if dist is None:
     return dist
   composite_dist = tfp.experimental.auto_composite_tensor(dist.__class__,
@@ -76,6 +85,12 @@ def _make_composite_tensor(dist):
       p[k] = composite_linop(**p[k].parameters)
   ac_dist = composite_dist(**p)
   return ac_dist
+
+
+def as_composite(obj):
+  if JAX_MODE:
+    return obj
+  return tfp.experimental.as_composite(obj)
 
 
 @test_util.test_graph_and_eager_modes
@@ -150,6 +165,8 @@ class PreconditionedHMCCorrectnessTest(test_util.TestCase):
       # Internal to the sampler, these scales are being used (implicitly).
       internal_scales = tf.ones(dims)
     elif precondition_scheme == 'sqrtm':
+      if JAX_MODE:
+        self.skipTest('`sqrtm` is not yet implemented in JAX.')
       momentum_distribution = tfde.MultivariateNormalPrecisionFactorLinearOperator(
           # The symmetric square root is a perfectly valid "factor".
           precision_factor=tf.linalg.LinearOperatorFullMatrix(
@@ -211,7 +228,8 @@ class PreconditionedHMCCorrectnessTest(test_util.TestCase):
       """Do a run, return RunHMCResults."""
       states, trace = tfp.mcmc.sample_chain(
           num_results,
-          current_state=tf.identity(target_mvn.sample(seed=0)),
+          current_state=tf.identity(target_mvn.sample(
+              seed=test_util.test_seed())),
           kernel=hmc_kernel,
           num_burnin_steps=num_adaptation_steps,
           seed=test_util.test_seed(),
@@ -379,14 +397,118 @@ class PreconditionedHMCCorrectnessTest(test_util.TestCase):
             0.5 if precondition_scheme == 'no_preconditioner' else 0.25),
     )
 
+  def test_sets_kinetic_energy(self):
+    dist = tfd.MultivariateNormalDiag(scale_diag=tf.constant([0.1, 10.]))
+    step_size = 0.1
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        target_log_prob_fn=dist.log_prob,
+        step_size=step_size,
+        num_leapfrog_steps=1,
+        store_parameters_in_results=True)
+    init_state = tf.constant([0.1, 0.1])
+    kr = kernel.bootstrap_results(init_state)
 
-@test_util.test_all_tf_execution_regimes
-@parameterized.named_parameters(
-    dict(testcase_name='_default', use_default=True),
-    dict(testcase_name='_explicit', use_default=False))
-class PreconditionedHMCTest(test_util.TestCase):
+    # Manually set the momentum distribution.
+    kr = unnest.replace_innermost(kr, momentum_distribution=dist)
 
-  def test_diag(self, use_default):
+    # Take one leapfrog step using the kernel.
+    _, nkr = kernel.one_step(init_state, kr, seed=test_util.test_seed())
+    # Need to evaluate here for consistency in graph mode.
+    (momentum_parts,
+     target_grad_parts,
+     proposed_state,
+     final_momentum,
+     target_log_prob,
+     grads_target_log_prob) = self.evaluate([
+         nkr.proposed_results.initial_momentum,
+         nkr.accepted_results.grads_target_log_prob,
+         nkr.proposed_state,
+         nkr.proposed_results.final_momentum,
+         nkr.proposed_results.target_log_prob,
+         nkr.proposed_results.grads_target_log_prob])
+
+    # Take one leapfrog step manually.
+    leapfrog = tfp.mcmc.internal.leapfrog_integrator.SimpleLeapfrogIntegrator(
+        target_fn=dist.log_prob,
+        step_sizes=[step_size],
+        num_steps=1)
+    # Again, need to evaluate here for graph mode consistency.
+    (next_momentum,
+     next_state,
+     next_target_log_prob,
+     grads_next_target_log_prob) = self.evaluate(leapfrog(
+         momentum_parts=momentum_parts,
+         state_parts=[init_state],
+         target=dist.log_prob(init_state),
+         target_grad_parts=target_grad_parts,
+         kinetic_energy_fn=lambda x: -dist.log_prob(x)))
+
+    # Verify resulting states are the same
+    self.assertAllClose(proposed_state,
+                        next_state[0])
+    self.assertAllClose(final_momentum,
+                        next_momentum)
+    self.assertAllClose(target_log_prob,
+                        next_target_log_prob)
+    self.assertAllClose(grads_target_log_prob,
+                        grads_next_target_log_prob)
+
+
+class _PreconditionedHMCTest(test_util.TestCase):
+
+  @test_util.test_graph_and_eager_modes()
+  def test_f64(self):
+    if self.use_default_momentum_distribution:
+      momentum_distribution = None
+    else:
+      momentum_distribution = as_composite(
+          tfd.Normal(0., tf.constant(.5, dtype=tf.float64)))
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        lambda x: -x**2, step_size=.5, num_leapfrog_steps=2,
+        momentum_distribution=momentum_distribution)
+    kernel = tfp.mcmc.SimpleStepSizeAdaptation(kernel, num_adaptation_steps=3)
+    self.evaluate(tfp.mcmc.sample_chain(
+        1, kernel=kernel, current_state=tf.ones([], tf.float64),
+        num_burnin_steps=5, trace_fn=None, seed=test_util.test_seed()))
+
+  @test_util.test_graph_and_eager_modes()
+  def test_f64_multichain(self):
+    if self.use_default_momentum_distribution:
+      momentum_distribution = None
+    else:
+      momentum_distribution = as_composite(
+          tfd.Normal(0., tf.constant(.5, dtype=tf.float64)))
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        lambda x: -x**2, step_size=.5, num_leapfrog_steps=2,
+        momentum_distribution=momentum_distribution)
+    kernel = tfp.mcmc.SimpleStepSizeAdaptation(kernel, num_adaptation_steps=3)
+    nchains = 7
+    self.evaluate(tfp.mcmc.sample_chain(
+        1, kernel=kernel, current_state=tf.ones([nchains], tf.float64),
+        num_burnin_steps=5, trace_fn=None, seed=test_util.test_seed()))
+
+  @test_util.test_graph_and_eager_modes()
+  def test_f64_multichain_multipart(self):
+    if self.use_default_momentum_distribution:
+      momentum_distribution = None
+    else:
+      momentum_distribution = _make_composite_tensor(
+          tfd.JointDistributionSequential([
+              tfd.Normal(0., tf.constant(.5, dtype=tf.float64)),
+              tfd.Normal(0., tf.constant(.25, dtype=tf.float64))]))
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        lambda x, y: -x**2 - y**2, step_size=.5, num_leapfrog_steps=2,
+        momentum_distribution=momentum_distribution)
+    kernel = tfp.mcmc.SimpleStepSizeAdaptation(kernel, num_adaptation_steps=3)
+    nchains = 7
+    self.evaluate(tfp.mcmc.sample_chain(
+        1, kernel=kernel,
+        current_state=(tf.ones([nchains], tf.float64),
+                       tf.ones([nchains], tf.float64)),
+        num_burnin_steps=5, trace_fn=None, seed=test_util.test_seed()))
+
+  @test_util.test_graph_mode_only()  # Long chains are very slow in eager mode.
+  def test_diag(self):
     """Test that a diagonal multivariate normal can be effectively sampled from.
 
     Note that the effective sample size is expected to be exactly 100: this is
@@ -394,15 +516,11 @@ class PreconditionedHMCTest(test_util.TestCase):
     a point to nearly the antipodal point, which causes a negative lag 1
     autocorrelation, and the effective sample size calculation cuts off when
     the autocorrelation drops below zero.
-
-    Args:
-      use_default: bool, whether to use a custom momentum distribution, or
-        the default.
     """
     mvn = tfd.MultivariateNormalDiag(
         loc=[1., 2., 3.], scale_diag=[0.1, 1., 10.])
 
-    if use_default:
+    if self.use_default_momentum_distribution:
       momentum_distribution = None
       step_size = 0.1
     else:
@@ -425,20 +543,20 @@ class PreconditionedHMCTest(test_util.TestCase):
                                          filter_threshold=0,
                                          filter_beyond_positive_pairs=False)
 
-    if not use_default:
+    if not self.use_default_momentum_distribution:
       self.assertAllClose(ess, tf.fill([3], 100.))
     else:
       self.assertLess(self.evaluate(tf.reduce_min(ess)), 100.)
 
-  def test_tril(self, use_default):
-    if tf.executing_eagerly():
-      self.skipTest('b/169882656 Too many warnings are issued in eager logs')
+  @test_util.test_graph_mode_only()  # Long chains are very slow in eager mode.
+  @test_util.jax_disable_test_missing_functionality('dynamic shapes')
+  def test_tril(self):
     cov = 0.9 * tf.ones([3, 3]) + 0.1 * tf.eye(3)
     scale = tf.linalg.cholesky(cov)
     mv_tril = tfd.MultivariateNormalTriL(loc=[1., 2., 3.],
                                          scale_tril=scale)
 
-    if use_default:
+    if self.use_default_momentum_distribution:
       momentum_distribution = None
     else:
       momentum_distribution = tfde.MultivariateNormalPrecisionFactorLinearOperator(
@@ -466,16 +584,17 @@ class PreconditionedHMCTest(test_util.TestCase):
     # was the wrong one. Why is that? A guess is that since there are *many*
     # ways to have larger ess, these tests don't really test correctness.
     # Perhaps remove all tests like these.
-    if not use_default:
+    if not self.use_default_momentum_distribution:
       self.assertAllClose(ess, tf.fill([3], 100.))
     else:
       self.assertLess(self.evaluate(tf.reduce_min(ess)), 100.)
 
-  def test_transform(self, use_default):
+  @test_util.test_graph_mode_only()  # Long chains are very slow in eager mode.
+  def test_transform(self):
     mvn = tfd.MultivariateNormalDiag(loc=[1., 2., 3.], scale_diag=[1., 1., 1.])
     diag_variance = tf.constant([0.1, 1., 10.])
 
-    if use_default:
+    if self.use_default_momentum_distribution:
       momentum_distribution = None
     else:
       momentum_distribution = tfde.MultivariateNormalPrecisionFactorLinearOperator(
@@ -500,19 +619,20 @@ class PreconditionedHMCTest(test_util.TestCase):
                                          filter_threshold=0,
                                          filter_beyond_positive_pairs=False)
 
-    if not use_default:
+    if not self.use_default_momentum_distribution:
       self.assertAllClose(ess, tf.fill([3], 100.))
     else:
       self.assertLess(self.evaluate(tf.reduce_min(ess)), 100.)
 
-  def test_multi_state_part(self, use_default):
+  @test_util.test_graph_mode_only()  # Long chains are very slow in eager mode.
+  def test_multi_state_part(self):
     mvn = tfd.JointDistributionSequential([
         tfd.Normal(1., 0.1),
         tfd.Normal(2., 1.),
         tfd.Independent(tfd.Normal(3 * tf.ones([2, 3, 4]), 10.), 3)
     ])
 
-    if use_default:
+    if self.use_default_momentum_distribution:
       momentum_distribution = None
       step_size = 0.1
     else:
@@ -545,7 +665,7 @@ class PreconditionedHMCTest(test_util.TestCase):
     ess = tfp.mcmc.effective_sample_size(draws,
                                          filter_threshold=0,
                                          filter_beyond_positive_pairs=False)
-    if not use_default:
+    if not self.use_default_momentum_distribution:
       self.assertAllClose(
           self.evaluate(ess),
           [tf.constant(100.),
@@ -556,11 +676,12 @@ class PreconditionedHMCTest(test_util.TestCase):
               tf.reduce_min(tf.nest.map_structure(tf.reduce_min, ess))),
           50.)
 
-  def test_batched_state(self, use_default):
+  @test_util.test_graph_mode_only()  # Long chains are very slow in eager mode.
+  def test_batched_state(self):
     mvn = tfd.MultivariateNormalDiag(
         loc=[1., 2., 3.], scale_diag=[0.1, 1., 10.])
     batch_shape = [2, 4]
-    if use_default:
+    if self.use_default_momentum_distribution:
       momentum_distribution = None
       step_size = 0.1
     else:
@@ -583,18 +704,19 @@ class PreconditionedHMCTest(test_util.TestCase):
     ess = tfp.mcmc.effective_sample_size(draws[10:], cross_chain_dims=[1, 2],
                                          filter_threshold=0,
                                          filter_beyond_positive_pairs=False)
-    if not use_default:
+    if not self.use_default_momentum_distribution:
       self.assertAllClose(self.evaluate(ess), 100 * 2. * 4. * tf.ones(3))
     else:
       self.assertLess(self.evaluate(tf.reduce_min(ess)), 100.)
 
-  def test_batches(self, use_default):
+  @test_util.test_graph_mode_only()  # Long chains are very slow in eager mode.
+  def test_batches(self):
     mvn = tfd.JointDistributionSequential(
         [tfd.Normal(1., 0.1),
          tfd.Normal(2., 1.),
          tfd.Normal(3., 10.)])
     n_chains = 10
-    if use_default:
+    if self.use_default_momentum_distribution:
       momentum_distribution = None
       step_size = 0.1
     else:
@@ -629,10 +751,139 @@ class PreconditionedHMCTest(test_util.TestCase):
     ess = tfp.mcmc.effective_sample_size(
         draws, cross_chain_dims=[1 for _ in draws],
         filter_threshold=0, filter_beyond_positive_pairs=False)
-    if not use_default:
+    if not self.use_default_momentum_distribution:
       self.assertAllClose(self.evaluate(ess), 100 * n_chains * tf.ones(3))
     else:
       self.assertLess(self.evaluate(tf.reduce_min(ess)), 100.)
+
+
+class PreconditionedHMCTestDefaultMomentum(_PreconditionedHMCTest):
+  use_default_momentum_distribution = True
+
+
+class PreconditionedHMCTestExplicitMomentum(_PreconditionedHMCTest):
+  use_default_momentum_distribution = False
+
+
+del _PreconditionedHMCTest  # Don't try to run base class tests.
+
+
+@test_util.test_all_tf_execution_regimes
+class DistributedPHMCTest(distribute_test_lib.DistributedTest):
+
+  def test_hmc_kernel_tracks_axis_names(self):
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        tfd.Normal(0, 1).log_prob,
+        step_size=1.9,
+        num_leapfrog_steps=2)
+    self.assertIsNone(kernel.experimental_shard_axis_names)
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        tfd.Normal(0, 1).log_prob,
+        step_size=1.9,
+        num_leapfrog_steps=2,
+        experimental_shard_axis_names=['a'])
+    self.assertListEqual(kernel.experimental_shard_axis_names, ['a'])
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        tfd.Normal(0, 1).log_prob,
+        step_size=1.9,
+        num_leapfrog_steps=2).experimental_with_shard_axes(['a'])
+    self.assertListEqual(kernel.experimental_shard_axis_names, ['a'])
+
+  def test_phmc_kernel_samples_correct_momenta_for_sharded_state(self):
+
+    if not JAX_MODE:
+      self.skipTest('Test in TF runs into `merge_call` error: see b/178944108')
+
+    def target_log_prob(a, b):
+      dist = tfd.Normal(0., 1.)
+      return dist.log_prob(a) + dist.log_prob(b)
+
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        target_log_prob,
+        step_size=1.9,
+        num_leapfrog_steps=2)
+    sharded_kernel = kernel.experimental_with_shard_axes([None, ['foo']])
+    def run(seed):
+      state = [0., 0.]
+      kr = sharded_kernel.bootstrap_results(state)
+      _, kr = sharded_kernel.one_step(state, kr, seed=seed)
+      return kr.proposed_results.initial_momentum
+
+    momentum = self.evaluate(self.per_replica_to_tensor(
+        self.strategy_run(run, args=(samplers.zeros_seed(),),
+                          in_axes=None, axis_name='foo'), 0))
+
+    # Unsharded state momenta should all be equal
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      self.assertAllClose(momentum[0][i], momentum[0][0])
+    # Sharded state momenta should be different
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      for j in range(distribute_test_lib.NUM_DEVICES):
+        if i == j:
+          continue
+        self.assertNotAllClose(momentum[1][i], momentum[1][j])
+
+  def test_computes_same_log_acceptance_correction_with_sharded_state(self):
+
+    if not JAX_MODE:
+      self.skipTest('Test in TF runs into `merge_call` error: see b/178944108')
+
+    def target_log_prob(a, b):
+      return (
+          tfd.Normal(0., 1.).log_prob(a)
+          + distribute_lib.psum(tfd.Normal(
+              distribute_lib.pbroadcast(a, 'foo'), 1.).log_prob(b), 'foo'))
+
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        target_log_prob,
+        step_size=1.9,
+        num_leapfrog_steps=2)
+    sharded_kernel = kernel.experimental_with_shard_axes([None, ['foo']])
+
+    def run(seed):
+      state = [0., 0.]
+      kr = sharded_kernel.bootstrap_results(state)
+      _, kr = sharded_kernel.one_step(state, kr, seed=seed)
+      return kr.proposed_results.log_acceptance_correction
+
+    log_acceptance_correction = self.evaluate(self.per_replica_to_tensor(
+        self.strategy_run(run, args=(samplers.zeros_seed(),),
+                          in_axes=None, axis_name='foo'), 0))
+
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      self.assertAllClose(log_acceptance_correction[i],
+                          log_acceptance_correction[0])
+
+  def test_unsharded_state_remains_synchronized_across_devices(self):
+
+    if not JAX_MODE:
+      self.skipTest('Test in TF runs into `merge_call` error: see b/178944108')
+
+    def target_log_prob(a, b):
+      return (
+          tfd.Normal(0., 1.).log_prob(a)
+          + distribute_lib.psum(tfd.Normal(
+              distribute_lib.pbroadcast(a, 'foo'), 1.).log_prob(b), 'foo'))
+
+    kernel = tfp.experimental.mcmc.PreconditionedHamiltonianMonteCarlo(
+        target_log_prob,
+        step_size=1e-1,
+        num_leapfrog_steps=2)
+    sharded_kernel = kernel.experimental_with_shard_axes([None, ['foo']])
+
+    def run(seed):
+      state = [-10., -10.]
+      kr = sharded_kernel.bootstrap_results(state)
+      state, _ = sharded_kernel.one_step(state, kr, seed=seed)
+      return state
+
+    state = self.evaluate(self.per_replica_to_tensor(
+        self.strategy_run(run, args=(samplers.zeros_seed(),),
+                          in_axes=None, axis_name='foo'), 0))
+
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      self.assertAllClose(state[0][i],
+                          state[0][0])
 
 
 if __name__ == '__main__':

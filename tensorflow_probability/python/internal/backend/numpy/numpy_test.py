@@ -136,7 +136,11 @@ positive_floats = functools.partial(floats, min_value=1e-6)
 
 
 def shapes(min_dims=0, max_dims=4, min_side=1, max_side=5):
-  strategy = hnp.array_shapes(max(1, min_dims), max_dims, min_side, max_side)
+  strategy = hnp.array_shapes(
+      min_dims=max(1, min_dims),
+      max_dims=max_dims,
+      min_side=min_side,
+      max_side=max_side)
   if min_dims < 1:
     strategy = hps.one_of(hps.just(()), strategy)
   return strategy
@@ -166,7 +170,7 @@ def n_same_shape(draw, n, shape=shapes(), dtype=None, elements=None,
       elements = integers()
     elif dtype in (np.complex64, np.complex128):
       elements = complex_numbers()
-    elif dtype == np.bool:
+    elif dtype == np.bool_:
       elements = hps.booleans()
     else:
       raise ValueError('Unexpected dtype: {}'.format(dtype))
@@ -314,7 +318,7 @@ def where_params(draw, version=2):
     x_shape, y_shape = shape, shape
   else:
     raise ValueError('unexpected tf.where version {}'.format(version))
-  condition = draw(single_arrays(shape=hps.just(cond_shape), dtype=np.bool))
+  condition = draw(single_arrays(shape=hps.just(cond_shape), dtype=np.bool_))
   x = draw(single_arrays(shape=hps.just(x_shape)))
   y = draw(single_arrays(shape=hps.just(y_shape), dtype=x.dtype))
   return condition, x, y
@@ -538,7 +542,7 @@ def segment_ids(draw, n):
   while rsum < n:
     lengths.append(draw(hps.integers(1, n-rsum)))
     rsum += lengths[-1]
-  return np.repeat(np.arange(len(lengths)), lengths)
+  return np.repeat(np.arange(len(lengths)), np.array(lengths))
 
 
 @hps.composite
@@ -562,9 +566,12 @@ def top_k_params(draw):
 
 @hps.composite
 def histogram_fixed_width_bins_params(draw):
+  # TODO(b/187125431): the `min_side=2` and `unique` check can be removed if
+  # https://github.com/tensorflow/tensorflow/pull/38899 is re-implemented.
   values = draw(single_arrays(
       dtype=np.float32,
-      shape=shapes(min_dims=1),
+      shape=shapes(min_dims=1, min_side=2),
+      unique=True,
       elements=hps.floats(min_value=-1e5, max_value=1e5)
   ))
   vmin, vmax = np.min(values), np.max(values)
@@ -663,6 +670,13 @@ def _qr_post_process(qr):
   return np.matmul(qr.q, qr.r), np.float32(qr.q.shape), np.float32(qr.r.shape)
 
 
+def _eig_post_process(vals):
+  if not isinstance(vals, tuple):
+    return np.sort(vals, axis=-1)
+  e, v = vals
+  return np.einsum('...ab,...b,...bc->...ac', v, e, v.swapaxes(-1, -2))
+
+
 # __Currently untested:__
 # broadcast_dynamic_shape
 # broadcast_static_shape
@@ -707,8 +721,8 @@ NUMPY_TEST_CASES = [
                 dtype=np.complex64,
                 elements=complex_numbers(max_magnitude=1e3))
         ],
-        atol=1e-3,
-        rtol=1e-3),
+        atol=2e-3,
+        rtol=2e-3),
     TestCase(
         'signal.rfft', [
             single_arrays(
@@ -798,8 +812,18 @@ NUMPY_TEST_CASES = [
     #         keywords=None,
     #         defaults=(False, False, False, False, False, False, None))
     TestCase('linalg.matmul', [matmul_compatible_pairs()]),
-    TestCase('linalg.det', [nonsingular_matrices()],
-             xla_disabled=True),  # TODO(b/162937268): missing kernel.
+    TestCase('linalg.eig', [pd_matrices()], post_processor=_eig_post_process,
+             xla_disabled=True),
+    TestCase('linalg.eigh', [pd_matrices()], post_processor=_eig_post_process),
+    TestCase('linalg.eigvals', [pd_matrices()],
+             post_processor=_eig_post_process, xla_disabled=True),
+    TestCase('linalg.eigvalsh', [pd_matrices()],
+             post_processor=_eig_post_process),
+    TestCase(
+        'linalg.det',
+        [nonsingular_matrices()],
+        rtol=1e-3,
+        xla_disabled=True),  # TODO(b/162937268): missing kernel.
 
     # ArgSpec(args=['a', 'name', 'conjugate'], varargs=None, keywords=None)
     TestCase('linalg.matrix_transpose',
@@ -922,7 +946,7 @@ NUMPY_TEST_CASES = [
             array_axis_tuples(
                 single_arrays(
                     shape=shapes(min_dims=1),
-                    dtype=np.bool,
+                    dtype=np.bool_,
                     elements=hps.booleans()),
                 allow_multi_axis=True)
         ],
@@ -932,7 +956,7 @@ NUMPY_TEST_CASES = [
             array_axis_tuples(
                 single_arrays(
                     shape=shapes(min_dims=1),
-                    dtype=np.bool,
+                    dtype=np.bool_,
                     elements=hps.booleans()))
         ],
         xla_const_args=(1,)),
@@ -1109,7 +1133,7 @@ NUMPY_TEST_CASES += [  # break the array for pylint to not timeout.
     TestCase('math.log_sigmoid',
              [single_arrays(elements=floats(min_value=-100.))]),
     TestCase('math.logical_not',
-             [single_arrays(dtype=np.bool, elements=hps.booleans())]),
+             [single_arrays(dtype=np.bool_, elements=hps.booleans())]),
     TestCase('math.ndtri', [single_arrays(elements=floats(0., 1.))]),
     TestCase('math.negative', [single_arrays()]),
     TestCase('math.reciprocal', [single_arrays()]),
@@ -1147,11 +1171,11 @@ NUMPY_TEST_CASES += [  # break the array for pylint to not timeout.
     TestCase('math.less', [n_same_shape(n=2)]),
     TestCase('math.less_equal', [n_same_shape(n=2)]),
     TestCase('math.logical_and',
-             [n_same_shape(n=2, dtype=np.bool, elements=hps.booleans())]),
+             [n_same_shape(n=2, dtype=np.bool_, elements=hps.booleans())]),
     TestCase('math.logical_or',
-             [n_same_shape(n=2, dtype=np.bool, elements=hps.booleans())]),
+             [n_same_shape(n=2, dtype=np.bool_, elements=hps.booleans())]),
     TestCase('math.logical_xor',
-             [n_same_shape(n=2, dtype=np.bool, elements=hps.booleans())]),
+             [n_same_shape(n=2, dtype=np.bool_, elements=hps.booleans())]),
     TestCase('math.maximum', [n_same_shape(n=2)]),
     TestCase('math.minimum', [n_same_shape(n=2)]),
     TestCase('math.multiply', [n_same_shape(n=2)]),
@@ -1761,7 +1785,7 @@ class NumpyTest(test_util.TestCase):
             alt_value = self.evaluate(
                 tf.function(
                     lambda args, kwargs: const_closure(*args, **kwargs),
-                    experimental_compile=True)(nonconst_args, nonconst_kwargs))
+                    jit_compile=True)(nonconst_args, nonconst_kwargs))
           else:
             alt_value = self.evaluate(
                 tpu_strategy.run(tf.function(const_closure),
@@ -1795,6 +1819,40 @@ class NumpyTest(test_util.TestCase):
 
       check_consistency(tensorflow_function, numpy_function)
 
+  def test_can_flatten_linear_operators(self):
+    if NUMPY_MODE:
+      self.skipTest('Flattening not supported in JAX backend.')
+
+    from jax import tree_util  # pylint: disable=g-import-not-at-top
+
+    self.assertLen(
+        tree_util.tree_leaves(nptf.linalg.LinearOperatorIdentity(5)), 0)
+
+    linop = nptf.linalg.LinearOperatorDiag(nptf.ones(5))
+    self.assertLen(tree_util.tree_leaves(linop), 1)
+    self.assertTupleEqual(tree_util.tree_leaves(linop)[0].shape, (5,))
+
+    linop = nptf.linalg.LinearOperatorLowerTriangular(nptf.eye(5))
+    self.assertLen(tree_util.tree_leaves(linop), 1)
+    self.assertTupleEqual(tree_util.tree_leaves(linop)[0].shape, (5, 5))
+
+    linop = nptf.linalg.LinearOperatorFullMatrix(nptf.eye(5))
+    self.assertLen(tree_util.tree_leaves(linop), 1)
+    self.assertTupleEqual(tree_util.tree_leaves(linop)[0].shape, (5, 5))
+
+    linop1 = nptf.linalg.LinearOperatorDiag(nptf.ones(3))
+    linop2 = nptf.linalg.LinearOperatorDiag(nptf.ones(4))
+    linop = nptf.linalg.LinearOperatorBlockDiag([linop1, linop2])
+    self.assertLen(tree_util.tree_leaves(linop), 2)
+    self.assertListEqual([a.shape for a in tree_util.tree_leaves(linop)],
+                         [(3,), (4,)])
+
+    linop1 = nptf.linalg.LinearOperatorFullMatrix(nptf.ones([4, 3]))
+    linop2 = nptf.linalg.LinearOperatorFullMatrix(nptf.ones([3, 2]))
+    linop = nptf.linalg.LinearOperatorComposition([linop1, linop2])
+    self.assertLen(tree_util.tree_leaves(linop), 2)
+    self.assertListEqual([a.shape for a in tree_util.tree_leaves(linop)],
+                         [(4, 3), (3, 2)])
 
 if __name__ == '__main__':
   tf.test.main()

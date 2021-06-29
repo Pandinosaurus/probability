@@ -153,7 +153,7 @@ class BetaTest(test_util.TestCase):
   def testLogPdfOnBoundaryIsFiniteWhenAlphaIsOne(self):
     b = [[0.01, 0.1, 1., 2], [5., 10., 2., 3]]
     pdf = self.evaluate(tfd.Beta(1., b, validate_args=True).prob(0.))
-    self.assertAllEqual(np.ones_like(pdf, dtype=np.bool), np.isfinite(pdf))
+    self.assertAllEqual(np.ones_like(pdf, dtype=np.bool_), np.isfinite(pdf))
 
   def testBetaMean(self):
     a = [1., 2, 3]
@@ -298,8 +298,8 @@ class BetaTest(test_util.TestCase):
     b = 10. * np.random.random(shape).astype(dt)
     x = np.random.random(shape).astype(dt)
     actual = self.evaluate(tfd.Beta(a, b, validate_args=True).cdf(x))
-    self.assertAllEqual(np.ones(shape, dtype=np.bool), 0. <= x)
-    self.assertAllEqual(np.ones(shape, dtype=np.bool), 1. >= x)
+    self.assertAllEqual(np.ones(shape, dtype=np.bool_), 0. <= x)
+    self.assertAllEqual(np.ones(shape, dtype=np.bool_), 1. >= x)
     self.assertAllClose(sp_stats.beta.cdf(x, a, b), actual, rtol=rtol, atol=0)
 
   def testBetaCdfBeyondSupport(self):
@@ -314,8 +314,8 @@ class BetaTest(test_util.TestCase):
     x = np.random.random(shape).astype(dt)
     actual = self.evaluate(
         tf.exp(tfd.Beta(a, b, validate_args=True).log_cdf(x)))
-    self.assertAllEqual(np.ones(shape, dtype=np.bool), 0. <= x)
-    self.assertAllEqual(np.ones(shape, dtype=np.bool), 1. >= x)
+    self.assertAllEqual(np.ones(shape, dtype=np.bool_), 0. <= x)
+    self.assertAllEqual(np.ones(shape, dtype=np.bool_), 1. >= x)
     self.assertAllClose(sp_stats.beta.cdf(x, a, b), actual, rtol=rtol, atol=0)
 
   def testBetaBetaKL(self):
@@ -434,6 +434,28 @@ class BetaTest(test_util.TestCase):
     def f(a):
       return tfd.Beta(a, 10).log_prob(.5)
     self.evaluate(tfp.math.value_and_gradient(f, [100.0]))
+
+  def testPdfOutsideSupport(self):
+    def mk_beta(c1, c0):
+      return tfd.Beta(c1, c0, force_probs_to_zero_outside_support=True)
+
+    # One or more boundary is +inf for c1<1 | c0<1.
+    self.assertAllFinite(mk_beta(1., .9).log_prob(0.))
+    self.assertAllEqual(mk_beta(1., .9).log_prob(1.), float('inf'))
+
+    self.assertAllEqual(mk_beta(.9, 1.).log_prob(0.), float('inf'))
+    self.assertAllFinite(mk_beta(.9, 1.).log_prob(1.))
+
+    self.assertAllEqual(mk_beta(.9, .7).log_prob(0.), float('inf'))
+    self.assertAllEqual(mk_beta(.9, .7).log_prob(1.), float('inf'))
+
+    # Both boundaries are non-inf for c1>=1 & c0>=1.
+    self.assertAllFinite(mk_beta(1., 1.).log_prob(0.))
+    self.assertAllFinite(mk_beta(1., 1.).log_prob(1.))
+
+    # Values outside [0,1] are always out of support.
+    self.assertAllEqual(mk_beta(1.1, 1.).log_prob(-.1), -float('inf'))
+    self.assertAllEqual(mk_beta(1., 1.1).log_prob(1.1), -float('inf'))
 
 
 if __name__ == '__main__':

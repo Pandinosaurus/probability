@@ -289,7 +289,7 @@ class UnzipTrace(jax_core.Trace):
                   unknown(mapped_aval(params['axis_size'], in_axis, pval[0]))
                   for pval, in_axis in zip(in_pvals, params['in_axes'])]
       out_axes_thunk = params['out_axes_thunk']
-      @jax_util.as_hashable_function(key=('unzip', out_axes_thunk))
+      @jax_util.as_hashable_function(closure=('unzip', out_axes_thunk))
       def new_out_axes_thunk():
         out_axes = out_axes_thunk()
         assert all(out_axis == 0 for out_axis in out_axes)
@@ -669,7 +669,7 @@ def _tracers_to_jaxpr(in_tracers, out_tracers):
         processed_eqn_ids.add(recipe.eqn_id)
     elif isinstance(recipe, pe.LambdaBinding):
       if not any(t is in_tracer for in_tracer in in_tracers):
-        raise VariableError('Found unknown input tracer.')
+        raise VariableError(f'Found unknown input tracer: {t}')
       assert in_tracers, 'Lambda binding with no args'
     elif isinstance(recipe, pe.FreeVar):
       env[getvar(t)] = recipe.val

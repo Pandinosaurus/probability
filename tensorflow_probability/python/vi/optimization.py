@@ -130,15 +130,15 @@ def fit_surrogate_posterior(target_log_prob_fn,
       emit more efficient code. This may drastically improve the performance.
       See the docs for `tf.function`. (In JAX, this will apply `jax.jit`).
       Default value: `None`.
-    seed: Optional seed for reproducible sampling.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
     name: Python `str` name prefixed to ops created by this function.
       Default value: 'fit_surrogate_posterior'.
 
   Returns:
-    results: `Tensor` or nested structure of `Tensor`s, according to the
-      return type of `result_fn`. Each `Tensor` has an added leading dimension
-      of size `num_steps`, packing the trajectory of the result over the course
-      of the optimization.
+    results: `Tensor` or nested structure of `Tensor`s, according to the return
+      type of `trace_fn`. Each `Tensor` has an added leading dimension of size
+      `num_steps`, packing the trajectory of the result over the course of the
+      optimization.
 
   #### Examples
 
@@ -291,7 +291,7 @@ def fit_surrogate_posterior(target_log_prob_fn,
        Springer, 2006.
   """
 
-  def complete_variational_loss_fn():
+  def complete_variational_loss_fn(seed=None):
     return variational_loss_fn(
         target_log_prob_fn,
         surrogate_posterior,
@@ -305,4 +305,5 @@ def fit_surrogate_posterior(target_log_prob_fn,
                            trace_fn=trace_fn,
                            trainable_variables=trainable_variables,
                            jit_compile=jit_compile,
+                           seed=seed,
                            name=name)

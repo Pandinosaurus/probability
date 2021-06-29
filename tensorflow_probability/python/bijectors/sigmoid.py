@@ -22,6 +22,7 @@ import tensorflow.compat.v2 as tf
 from tensorflow_probability.python.bijectors import bijector
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
 
 
@@ -63,7 +64,7 @@ else:
     return y, grad_fn
 
 
-class Sigmoid(bijector.Bijector):
+class Sigmoid(bijector.AutoCompositeTensorBijector):
   """Bijector that computes the logistic sigmoid function.
 
   If the `low` and `high` parameters are not passed, the transformation is
@@ -124,6 +125,16 @@ class Sigmoid(bijector.Bijector):
   @classmethod
   def _is_increasing(cls):
     return True
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict(
+        low=parameter_properties.ParameterProperties(),
+        # TODO(b/169874884): add an optional `width` parameter to decouple the
+        # `high > low` constraint into a single `width > 0` constraint.
+        high=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=parameter_properties
+            .BIJECTOR_NOT_IMPLEMENTED))
 
   @property
   def low(self):

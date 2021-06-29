@@ -165,6 +165,24 @@ class GammaTest(test_util.TestCase):
     self.assertAllClose(cdf, expected_cdf)
     self.assertAllClose(gamma_lr.cdf(x), expected_cdf)
 
+  def testGammaQuantile(self):
+    batch_size = 6
+    concentration = np.linspace(
+        1, 10., batch_size).astype(np.float32)[..., np.newaxis]
+    rate = np.linspace(3., 7., batch_size).astype(np.float32)[..., np.newaxis]
+    x = np.array([0.1, 0.2, 0.3, 0.9, 0.8, 0.5, 0.7], dtype=np.float32)
+
+    gamma = tfd.Gamma(
+        concentration=concentration, rate=rate, validate_args=True)
+    gamma_lr = tfd.Gamma(
+        concentration=concentration, log_rate=tf.math.log(rate),
+        validate_args=True)
+    quantile = gamma.quantile(x)
+    self.assertEqual(quantile.shape, (6, 7))
+    expected_quantile = sp_stats.gamma.ppf(x, concentration, scale=1 / rate)
+    self.assertAllClose(quantile, expected_quantile)
+    self.assertAllClose(gamma_lr.quantile(x), expected_quantile)
+
   def testGammaMean(self):
     concentration_v = np.array([1.0, 3.0, 2.5])
     rate_v = np.array([1.0, 4.0, 5.0])
@@ -303,7 +321,7 @@ class GammaTest(test_util.TestCase):
         sp_stats.gamma.var(concentration_v, scale=1 / rate_v),
         atol=.15)
 
-  def testGammaSampleReturnsNansForNonPositiveParameters(self):
+  def testGammaSampleZeroAndNegativeParameters(self):
     gamma = tfd.Gamma([1., 2.], 1., validate_args=False)
     seed_stream = test_util.test_seed_stream()
     samples = self.evaluate(gamma.sample(seed=seed_stream()))
@@ -311,6 +329,12 @@ class GammaTest(test_util.TestCase):
     self.assertAllFinite(samples)
 
     gamma = tfd.Gamma([0., 2.], 1., validate_args=False)
+    samples = self.evaluate(gamma.sample(seed=seed_stream()))
+    self.assertEqual(samples.shape, (2,))
+    self.assertAllEqual([s in [0, np.finfo(np.float32).tiny]
+                         for s in samples], [True, False])
+
+    gamma = tfd.Gamma([-0.001, 2.], 1., validate_args=False)
     samples = self.evaluate(gamma.sample(seed=seed_stream()))
     self.assertEqual(samples.shape, (2,))
     self.assertAllEqual([np.isnan(s) for s in samples], [True, False])
@@ -600,6 +624,7 @@ class GammaSamplingTest(test_util.TestCase):
 
   @test_util.jax_disable_test_missing_functionality('tf stateless_gamma')
   def testSampleCPU(self):
+    self.skipTest('b/179283344')
     with tf.device('CPU'):
       _, runtime = self.evaluate(
           gamma_lib.random_gamma_with_runtime(
@@ -620,14 +645,14 @@ class GammaSamplingTest(test_util.TestCase):
 
   def testSampleXLA(self):
     self.skip_if_no_xla()
-    if not tf.executing_eagerly(): return  # experimental_compile is eager-only.
+    if not tf.executing_eagerly(): return  # jit_compile is eager-only.
     concentration = np.exp(np.random.rand(4, 3).astype(np.float32))
     rate = np.exp(np.random.rand(4, 3).astype(np.float32))
     dist = tfd.Gamma(concentration=concentration, rate=rate, validate_args=True)
     # Verify the compile succeeds going all the way through the distribution.
     self.evaluate(
         tf.function(lambda: dist.sample(5, seed=test_util.test_seed()),
-                    experimental_compile=True)())
+                    jit_compile=True)())
     # Also test the low-level sampler and verify the XLA-friendly variant.
     # TODO(bjp): functools.partial, after eliminating PY2 which breaks
     # tf_inspect in interesting ways:
@@ -636,7 +661,7 @@ class GammaSamplingTest(test_util.TestCase):
     # not be expressed with ArgSpec.
     scalar_gamma = tf.function(
         lambda **kwds: gamma_lib.random_gamma_with_runtime(shape=[], **kwds),
-        experimental_compile=True)
+        jit_compile=True)
     _, runtime = self.evaluate(
         scalar_gamma(
             concentration=tf.constant(1.),
@@ -864,6 +889,19 @@ class GammaSamplingTest(test_util.TestCase):
             samples,
             concentration_np,
             rate_np), axis=(0, 2))[..., np.newaxis], rtol=1e-3)
+
+  def testPdfOutsideSupport(self):
+    def mk_gamma(c):
+      return tfd.Gamma(c, 1, force_probs_to_zero_outside_support=True)
+    self.assertAllEqual(mk_gamma(.99).log_prob(-.1), -float('inf'))
+    self.assertAllEqual(mk_gamma(.99).log_prob(0), float('inf'))
+    self.assertAllGreater(mk_gamma(.99).log_prob(0.1), -float('inf'))
+    self.assertAllEqual(mk_gamma(1).log_prob(-.1), -float('inf'))
+    self.assertAllClose(mk_gamma(1).log_prob(0), 0.)
+    self.assertAllGreater(mk_gamma(1).log_prob(.1), -float('inf'))
+    self.assertAllEqual(mk_gamma(1.01).log_prob(-.1), -float('inf'))
+    self.assertAllEqual(mk_gamma(1.01).log_prob(0), -float('inf'))
+    self.assertAllGreater(mk_gamma(1.01).log_prob(.1), -float('inf'))
 
 
 if __name__ == '__main__':

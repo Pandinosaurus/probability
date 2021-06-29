@@ -56,7 +56,7 @@ def make_test_nuts_kernel_fn(target_log_prob_fn,
       max_tree_depth=max_tree_depth)
 
 
-@test_util.test_all_tf_execution_regimes
+@test_util.test_graph_and_eager_modes
 class SampleSequentialMonteCarloTest(test_util.TestCase):
 
   def testCorrectStepSizeTransformedkernel(self):
@@ -86,6 +86,9 @@ class SampleSequentialMonteCarloTest(test_util.TestCase):
       ('NUTS', make_test_nuts_kernel_fn, 0.8),
   )
   def testMixtureTargetLogProb(self, make_kernel_fn, optimal_accept):
+    if tf.executing_eagerly():
+      self.skipTest('Skipping eager-mode test to reduce test weight.')
+
     seed = test_util.test_seed()
     # Generate a 2 component Gaussian Mixture in 3 dimension
     nd = 3
@@ -234,7 +237,7 @@ class SampleSequentialMonteCarloTest(test_util.TestCase):
     make_transform_hmc_kernel_fn = gen_make_transform_hmc_kernel_fn(
         unconstraining_bijectors, num_leapfrog_steps=5)
 
-    @tf.function(autograph=False, experimental_compile=True)
+    @tf.function(autograph=False, jit_compile=True)
     def run_smc():
       # Ensure we're really in graph mode.
       assert hasattr(tf.constant([]), 'graph')

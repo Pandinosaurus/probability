@@ -23,9 +23,9 @@ from __future__ import print_function
 from tensorflow_probability.python.bijectors.absolute_value import AbsoluteValue
 from tensorflow_probability.python.bijectors.affine import Affine
 from tensorflow_probability.python.bijectors.affine_linear_operator import AffineLinearOperator
-from tensorflow_probability.python.bijectors.affine_scalar import AffineScalar
 from tensorflow_probability.python.bijectors.ascending import Ascending
 from tensorflow_probability.python.bijectors.batch_normalization import BatchNormalization
+from tensorflow_probability.python.bijectors.bijector import AutoCompositeTensorBijector
 from tensorflow_probability.python.bijectors.bijector import Bijector
 from tensorflow_probability.python.bijectors.blockwise import Blockwise
 from tensorflow_probability.python.bijectors.chain import Chain
@@ -75,7 +75,9 @@ from tensorflow_probability.python.bijectors.real_nvp import real_nvp_default_te
 from tensorflow_probability.python.bijectors.real_nvp import RealNVP
 from tensorflow_probability.python.bijectors.reciprocal import Reciprocal
 from tensorflow_probability.python.bijectors.reshape import Reshape
+from tensorflow_probability.python.bijectors.restructure import pack_sequence_as
 from tensorflow_probability.python.bijectors.restructure import Restructure
+from tensorflow_probability.python.bijectors.restructure import tree_flatten
 from tensorflow_probability.python.bijectors.scale import Scale
 from tensorflow_probability.python.bijectors.scale_matvec_diag import ScaleMatvecDiag
 from tensorflow_probability.python.bijectors.scale_matvec_linear_operator import ScaleMatvecLinearOperator
@@ -106,8 +108,8 @@ __all__ = [
     "AbsoluteValue",
     "Affine",
     "AffineLinearOperator",
-    "AffineScalar",
     "Ascending",
+    "AutoCompositeTensorBijector",
     "AutoregressiveNetwork",
     "BatchNormalization",
     "Bijector",
@@ -182,5 +184,7 @@ __all__ = [
     "WeibullCDF",
     "masked_autoregressive_default_template",
     "masked_dense",
+    "pack_sequence_as",
     "real_nvp_default_template",
+    "tree_flatten",
 ]

@@ -20,6 +20,7 @@ load(
     "multi_substrate_py_library",
     "multi_substrate_py_test",
 )
+# [internal] load pytype.bzl (pytype_strict_test)
 
 licenses(["notice"])
 
@@ -27,7 +28,6 @@ package(
     default_visibility = [
         "//tensorflow_probability:__subpackages__",
 #         "//tensorflow_probability/google:friends",  # DisableOnExport
-        "//discussion/fun_mcmc:__subpackages__",
     ],
 )
 
@@ -56,15 +56,22 @@ multi_substrate_py_library(
     ],
 )
 
+# pytype_strict
 py_test(
     name = "auto_composite_tensor_test",
     srcs = ["auto_composite_tensor_test.py"],
+    data = glob(["testdata/auto_composite_tensor/**"]),
     python_version = "PY3",
     srcs_version = "PY3",
     deps = [
+        ":auto_composite_tensor",
+        ":tensor_util",
+        ":test_util",
+        # absl/flags dep,
+        # absl/testing:absltest dep,
+        # absl/testing:parameterized dep,
         # tensorflow dep,
         "//tensorflow_probability",
-        "//tensorflow_probability/python/internal:test_util",
     ],
 )
 
@@ -79,9 +86,73 @@ multi_substrate_py_library(
 )
 
 multi_substrate_py_library(
+    name = "batch_shape_lib",
+    srcs = ["batch_shape_lib.py"],
+    srcs_version = "PY3",
+    deps = [
+        # tensorflow dep,
+    ],
+)
+
+multi_substrate_py_test(
+    name = "batch_shape_lib_test",
+    size = "small",
+    srcs = ["batch_shape_lib_test.py"],
+    deps = [
+        ":test_util",
+        # numpy dep,
+        # tensorflow dep,
+        "//tensorflow_probability",
+    ],
+)
+
+multi_substrate_py_library(
+    name = "distribute_lib",
+    srcs = ["distribute_lib.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":custom_gradient",
+        ":prefer_static",
+        ":samplers",
+        # tensorflow dep,
+        "//tensorflow_probability/python/math:gradient",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "distribute_lib_test",
+    size = "medium",
+    srcs = ["distribute_lib_test.py"],
+    disabled_substrates = ["numpy"],
+    python_version = "PY3",
+    srcs_version = "PY3",
+    deps = [
+        ":distribute_lib",
+        ":distribute_test_lib",
+        ":test_util",
+        # absl/testing:parameterized dep,
+        # tensorflow dep,
+        "//tensorflow_probability",
+    ],
+)
+
+multi_substrate_py_library(
+    name = "distribute_test_lib",
+    testonly = 1,
+    srcs = ["distribute_test_lib.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":distribution_util",
+        ":test_util",
+        # tensorflow dep,
+    ],
+)
+
+multi_substrate_py_library(
     name = "batched_rejection_sampler",
     srcs = ["batched_rejection_sampler.py"],
     deps = [
+        ":broadcast_util",
         ":samplers",
         # numpy dep,  # For np.nan
         # tensorflow dep,
@@ -101,6 +172,25 @@ multi_substrate_py_test(
         # scipy dep,
         # tensorflow dep,
         "//tensorflow_probability",
+    ],
+)
+
+multi_substrate_py_library(
+    name = "broadcast_util",
+    srcs = ["broadcast_util.py"],
+    deps = [
+        # tensorflow dep,
+        "//tensorflow_probability/python/internal:prefer_static",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "broadcast_util_test",
+    srcs = ["broadcast_util_test.py"],
+    deps = [
+        ":broadcast_util",
+        ":test_util",
+        # tensorflow dep,
     ],
 )
 
@@ -313,6 +403,30 @@ multi_substrate_py_test(
         ":nest_util",
         # absl/testing:parameterized dep,
         # numpy dep,
+        # tensorflow dep,
+        "//tensorflow_probability/python/internal:test_util",
+    ],
+)
+
+multi_substrate_py_library(
+    name = "numerics_testing",
+    srcs = ["numerics_testing.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":dtype_util",
+        # absl/logging dep,
+        # numpy dep,
+        # tensorflow dep,
+        "//tensorflow_probability/python/math:gradient",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "numerics_testing_test",
+    size = "small",
+    srcs = ["numerics_testing_test.py"],
+    deps = [
+        ":numerics_testing",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:test_util",
     ],

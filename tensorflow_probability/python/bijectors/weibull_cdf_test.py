@@ -40,7 +40,7 @@ class WeibullCDFBijectorTest(test_util.TestCase):
     self.assertStartsWith(bijector.name, 'weibull')
     x = np.array([[[0.], [1.], [14.], [20.], [100.]]], dtype=np.float32)
     # Weibull distribution
-    weibull_dist = stats.frechet_r(c=concentration, scale=scale)
+    weibull_dist = stats.weibull_min(c=concentration, scale=scale)
     y = weibull_dist.cdf(x).astype(np.float32)
     self.assertAllClose(y, self.evaluate(bijector.forward(x)))
     self.assertAllClose(x, self.evaluate(bijector.inverse(y)))
@@ -59,7 +59,7 @@ class WeibullCDFBijectorTest(test_util.TestCase):
     scale = np.logspace(0.1, 10., num=20).astype(np.float32)
     bijector = tfb.WeibullCDF(scale, concentration=1.)
     fldj = self.evaluate(bijector.forward_log_det_jacobian(0., event_ndims=0))
-    self.assertAllEqual(np.ones_like(fldj, dtype=np.bool), np.isfinite(fldj))
+    self.assertAllEqual(np.ones_like(fldj, dtype=np.bool_), np.isfinite(fldj))
 
   def testScalarCongruency(self):
     bijector_test_util.assert_scalar_congruency(

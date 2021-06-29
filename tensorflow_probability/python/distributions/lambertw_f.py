@@ -27,7 +27,6 @@ from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import parameter_properties
-from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import tensor_util
 
 
@@ -132,6 +131,7 @@ class LambertWDistribution(transformed_distribution.TransformedDistribution):
   def _parameter_properties(cls, dtype, num_classes=None):
     # pylint: disable=g-long-lambda
     return dict(
+        distribution=parameter_properties.BatchedComponentProperties(),
         shift=parameter_properties.ParameterProperties(),
         scale=parameter_properties.ParameterProperties(
             default_constraining_bijector_fn=(
@@ -160,19 +160,7 @@ class LambertWDistribution(transformed_distribution.TransformedDistribution):
     """Distribution parameter for the tail parameter delta."""
     return self._tailweight
 
-  def _batch_shape_tensor(self, shift=None, scale=None, tailweight=None):
-    """Returns the batch shape of tensor parameter broadcasting."""
-    return ps.shape(
-        ps.shape(self.tailweight if tailweight is None
-                 else tailweight,
-                 ps.shape(self.shift if shift is None else shift)),
-        ps.shape(self.scale if scale is None else scale))
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(
-        tf.broadcast_static_shape(self.tailweight.shape,
-                                  self.shift.shape),
-        self.scale.shape)
+  experimental_is_sharded = False
 
 
 class LambertWNormal(LambertWDistribution):
@@ -298,20 +286,6 @@ class LambertWNormal(LambertWDistribution):
     # independent of the tail parameter.
     loc = tf.convert_to_tensor(self.loc)
     return tf.broadcast_to(loc, self.batch_shape)
-
-  def _batch_shape_tensor(self, loc=None, scale=None, tailweight=None):
-    """Returns the batch shape of tensor parameter broadcasting."""
-    return ps.shape(
-        ps.shape(self.tailweight if tailweight is None
-                 else tailweight,
-                 ps.shape(self.loc if loc is None else loc)),
-        ps.shape(self.scale if scale is None else scale))
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(
-        tf.broadcast_static_shape(self.tailweight.shape,
-                                  self.loc.shape),
-        self.scale.shape)
 
   def _parameter_control_dependencies(self, is_init):
     if not self.validate_args:

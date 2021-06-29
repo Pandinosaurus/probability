@@ -24,6 +24,7 @@ import abc
 import six
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python import bijectors as tfb
 from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import kullback_leibler
 from tensorflow_probability.python.internal import assert_util
@@ -41,7 +42,7 @@ __all__ = [
 
 
 @six.add_metaclass(abc.ABCMeta)
-class _BaseDeterministic(distribution.Distribution):
+class _BaseDeterministic(distribution.AutoCompositeTensorDistribution):
   """Base class for Deterministic distributions."""
 
   def __init__(self,
@@ -136,10 +137,20 @@ class _BaseDeterministic(distribution.Distribution):
     return tf.zeros(self.batch_shape_tensor(), dtype=self.dtype)
 
   def _mean(self):
-    return tf.identity(self.loc)
+    loc = tf.convert_to_tensor(self.loc)
+    return tf.broadcast_to(
+        loc,
+        ps.concat([self._batch_shape_tensor(loc=loc),
+                   self._event_shape_tensor(loc=loc)],
+                  axis=0))
 
   def _variance(self):
-    return tf.zeros_like(self.loc)
+    loc = tf.convert_to_tensor(self.loc)
+    return tf.broadcast_to(
+        tf.zeros_like(loc),
+        ps.concat([self._batch_shape_tensor(loc=loc),
+                   self._event_shape_tensor(loc=loc)],
+                  axis=0))
 
   def _mode(self):
     return self.mean()
@@ -154,7 +165,14 @@ class _BaseDeterministic(distribution.Distribution):
                   axis=0))
 
   def _default_event_space_bijector(self):
-    return
+    """The bijector maps a zero-dimensional null Tensor input to `self.loc`."""
+    # The shape of the pulled back null tensor will be `self.loc.shape + (0,)`.
+    # First we pad to a tensor of zeros with shape `self.loc.shape + (1,)`.
+    pad_zero = tfb.Pad([(1, 0)])
+    # Next, we squeeze to a tensor of zeros with shape matching `self.loc`.
+    zeros_squeezed = tfb.Reshape([], event_shape_in=[1])(pad_zero)
+    # Finally, we shift the zeros by `self.loc`.
+    return tfb.Shift(self.loc)(zeros_squeezed)
 
   def _parameter_control_dependencies(self, is_init):
     assertions = []
@@ -284,19 +302,9 @@ class Deterministic(_BaseDeterministic):
             .BIJECTOR_NOT_IMPLEMENTED,
             is_preferred=False))
 
-  def _batch_shape_tensor(self, loc=None):
-    return ps.broadcast_shape(
-        ps.shape(self.loc if loc is None else loc),
-        ps.broadcast_shape(ps.shape(self.atol), ps.shape(self.rtol)))
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(
-        self.loc.shape,
-        tf.broadcast_static_shape(self.atol.shape, self.rtol.shape))
-
   def _event_shape_tensor(self, loc=None):
     del loc
-    return tf.constant([], dtype=tf.int32)
+    return ps.constant([], dtype=tf.int32)
 
   def _event_shape(self):
     return tf.TensorShape([])
@@ -309,7 +317,7 @@ class Deterministic(_BaseDeterministic):
     return tf.cast(tf.abs(x - loc) <= self._slack(loc), dtype=prob_dtype)
 
   def _cdf(self, x):
-    loc = tf.identity(self.loc)
+    loc = tensor_util.identity_as_tensor(self.loc)
     return tf.cast(x >= loc - self._slack(loc), dtype=self.dtype)
 
 
@@ -418,16 +426,6 @@ class VectorDeterministic(_BaseDeterministic):
             default_constraining_bijector_fn=parameter_properties
             .BIJECTOR_NOT_IMPLEMENTED,
             is_preferred=False))
-
-  def _batch_shape_tensor(self, loc=None):
-    return ps.broadcast_shape(
-        ps.shape(self.loc if loc is None else loc),
-        ps.broadcast_shape(ps.shape(self.atol), ps.shape(self.rtol)))[:-1]
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(
-        self.loc.shape,
-        tf.broadcast_static_shape(self.atol.shape, self.rtol.shape))[:-1]
 
   def _event_shape_tensor(self, loc=None):
     return ps.shape(self.loc if loc is None else loc)[-1:]

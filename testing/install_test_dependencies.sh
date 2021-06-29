@@ -40,6 +40,9 @@
 # commands, telling pip to install the dependencies in the user install
 # directory.
 
+set -v  # print commands as they are executed
+set -e  # fail and exit on any command erroring
+
 # Get the absolute path to the directory containing this script.
 DIR=$(cd $(dirname "${BASH_SOURCE[0]}") && pwd)
 
@@ -80,29 +83,38 @@ fi
 PYTHON_PARSE_PACKAGE_JSON="
 import sys
 import json
+import argparse
+import sysconfig
+
+
+parser = argparse.ArgumentParser(description='Parse pypi json')
+parser.add_argument(
+    '--bad_dates', type=str, nargs='*',
+    help='Bad dates to be avoided. Space-separated')
+args = parser.parse_args()
+
+pypi_version_str = 'cp' + sysconfig.get_config_var('py_version_nodot')
+
 package_data = json.loads(sys.stdin.read())
-linux_versions = []
+releases = []
 for release, release_info in package_data['releases'].items():
-  if any('linux' in wheel['filename'] for wheel in release_info):
-    print(release)
+  # Skip bad dates.
+  if any(bad_date in release for bad_date in args.bad_dates):
+    continue
+
+  # Make sure there's a manylinux wheel file for given python_version.
+  if not any(('manylinux' in wheel_info['filename'] and
+              wheel_info['python_version'] in pypi_version_str)
+             for wheel_info in release_info):
+    continue
+  releases.append(release)
+print(sorted(releases)[-1])
 "
 
 find_good_tf_nightly_version_str() {
-  PKG_NAME=$1
-  # These are nightly builds we'd like to avoid for some reason; separated by
-  # regex OR operator.
-  BAD_NIGHTLY_DATES="20200112\|20200113"
-  # This will fail to find version 'X" and log available version strings to
-  # stderr. We then sort, remove bad versions and take the last entry. This
-  # allows us to avoid hardcoding the main version number, which would then need
-  # to be updated on every new TF release.
-  VERSIONS=$(curl -s https://pypi.org/pypi/$PKG_NAME/json \
-    | python -c "$PYTHON_PARSE_PACKAGE_JSON")
-  echo $VERSIONS \
-    | grep -o "[0-9.]\+dev[0-9]\{8\}" \
-    | sort \
-    | grep -v "$BAD_NIGHTLY_DATES" \
-    | tail -n1
+  curl -s https://pypi.org/pypi/tf-nightly/json \
+    | python -c "$PYTHON_PARSE_PACKAGE_JSON" \
+        --bad_dates 20210519 20210619
 }
 
 has_tensorflow_packages() {
@@ -169,29 +181,26 @@ install_jax() {
 }
 
 install_python_packages() {
-  # Ensure newer than 18.x pip version, which is necessary after tf-nightly
-  # switched to manylinux2010.
-  python -m pip install $PIP_FLAGS --upgrade 'pip>=19.2'
-
   install_tensorflow
   install_jax
 
   # The following unofficial dependencies are used only by tests.
   # TODO(b/148685448): Unpin Hypothesis and coverage versions.
-  python -m pip install $PIP_FLAGS hypothesis==3.56.5 coverage==4.4.2 matplotlib mock scipy
+  python -m pip install $PIP_FLAGS hypothesis==3.56.5 coverage==4.4.2 matplotlib mock mpmath scipy
 
   # Install additional TFP dependencies.
   python -m pip install $PIP_FLAGS decorator 'cloudpickle>=1.3' dm-tree
-
-  # Upgrade numpy to the latest to address issues that happen when testing with
-  # Python 3 (https://github.com/tensorflow/tensorflow/issues/16488).
-  python -m pip install -U $PIP_FLAGS numpy
 
   # Print out all versions, as an FYI in the logs.
   python --version
   python -m pip --version
   python -m pip list
 }
+
+# Ensure newer than 18.x pip version, which is necessary after tf-nightly
+# switched to manylinux2010.
+python -m pip install $PIP_FLAGS --upgrade 'pip>=19.2'
+python -m pip install --upgrade setuptools
 
 check_for_common_package_conflicts
 install_python_packages

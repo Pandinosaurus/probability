@@ -23,12 +23,14 @@ import tensorflow.compat.v2 as tf
 from tensorflow_probability.python.bijectors import identity as identity_bijector
 from tensorflow_probability.python.bijectors import scale_matvec_linear_operator
 from tensorflow_probability.python.bijectors import shift as shift_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import kullback_leibler
 from tensorflow_probability.python.distributions import normal
 from tensorflow_probability.python.distributions import sample
 from tensorflow_probability.python.distributions import transformed_distribution
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.internal import tensorshape_util
@@ -57,7 +59,8 @@ or
 
 
 class MultivariateNormalLinearOperator(
-    transformed_distribution.TransformedDistribution):
+    transformed_distribution.TransformedDistribution,
+    distribution.AutoCompositeTensorDistribution):
   """The multivariate normal distribution on `R^k`.
 
   The Multivariate Normal distribution is defined over `R^k` and parameterized
@@ -142,6 +145,7 @@ class MultivariateNormalLinearOperator(
                scale=None,
                validate_args=False,
                allow_nan_stats=True,
+               experimental_use_kahan_sum=False,
                name='MultivariateNormalLinearOperator'):
     """Construct Multivariate Normal distribution on `R^k`.
 
@@ -168,6 +172,13 @@ class MultivariateNormalLinearOperator(
         exception if a statistic (e.g. mean/mode/etc...) is undefined for any
         batch member If `True`, batch members with valid parameters leading to
         undefined statistics will return NaN for this statistic.
+      experimental_use_kahan_sum: Python `bool`. When `True`, we use Kahan
+        summation to aggregate independent underlying log_prob values. For best
+        results, Kahan summation should also be applied when computing the
+        log-determinant of the `LinearOperator` representing the scale matrix.
+        Kahan summation improves against the precision of a naive float32 sum.
+        This can be noticeable in particular for large dimensions in float32.
+        See CPU caveat on `tfp.math.reduce_kahan_sum`.
       name: The name to give Ops created by the initializer.
 
     Raises:
@@ -175,6 +186,7 @@ class MultivariateNormalLinearOperator(
       TypeError: if not `scale.dtype.is_floating`
     """
     parameters = dict(locals())
+    self._experimental_use_kahan_sum = experimental_use_kahan_sum
     if scale is None:
       raise ValueError('Missing required `scale` parameter.')
     if not dtype_util.is_floating(scale.dtype):
@@ -207,7 +219,8 @@ class MultivariateNormalLinearOperator(
             normal.Normal(
                 loc=tf.zeros(batch_shape, dtype=dtype),
                 scale=tf.ones([], dtype=dtype)),
-            event_shape),
+            event_shape,
+            experimental_use_kahan_sum=experimental_use_kahan_sum),
         bijector=bijector,
         validate_args=validate_args,
         name=name)
@@ -223,6 +236,14 @@ class MultivariateNormalLinearOperator(
     """The `scale` `LinearOperator` in `Y = scale @ X + loc`."""
     return self._scale
 
+  experimental_is_sharded = False
+
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    return dict(
+        loc=parameter_properties.ParameterProperties(event_ndims=1),
+        scale=parameter_properties.BatchedComponentProperties())
+
   @distribution_util.AppendDocstring(_mvn_sample_note)
   def _log_prob(self, x):
     return super(MultivariateNormalLinearOperator, self)._log_prob(x)
@@ -232,29 +253,30 @@ class MultivariateNormalLinearOperator(
     return super(MultivariateNormalLinearOperator, self)._prob(x)
 
   def _mean(self):
-    shape = tensorshape_util.concatenate(self.batch_shape, self.event_shape)
-    has_static_shape = tensorshape_util.is_fully_defined(shape)
-    if not has_static_shape:
-      shape = tf.concat([
-          self.batch_shape_tensor(),
-          self.event_shape_tensor(),
-      ], 0)
+    shape = ps.concat([
+        self.batch_shape_tensor(),
+        self.event_shape_tensor(),
+    ], axis=0)
 
     if self.loc is None:
       return tf.zeros(shape, self.dtype)
 
-    if has_static_shape and shape == self.loc.shape:
-      return tf.identity(self.loc)
-
-    # Add dummy tensor of zeros to broadcast.  This is only necessary if shape
-    # != self.loc.shape, but we could not determine if this is the case.
-    return tf.identity(self.loc) + tf.zeros(shape, self.dtype)
+    return tf.broadcast_to(self.loc, shape)
 
   def _covariance(self):
     if distribution_util.is_diagonal_scale(self.scale):
-      return tf.linalg.diag(tf.square(self.scale.diag_part()))
+      cov = tf.linalg.diag(tf.square(self.scale.diag_part()))
     else:
-      return self.scale.matmul(self.scale.to_dense(), adjoint_arg=True)
+      cov = self.scale.matmul(self.scale.to_dense(), adjoint_arg=True)
+    if self.loc is not None:
+      loc_shape = ps.shape(self.loc)
+      loc_plus_extra_event_shape = ps.concat([
+          loc_shape,
+          loc_shape[-1:],
+      ], axis=0)
+      cov = tf.broadcast_to(
+          cov, ps.broadcast_shape(ps.shape(cov), loc_plus_extra_event_shape))
+    return cov
 
   def _variance(self):
     if distribution_util.is_diagonal_scale(self.scale):
@@ -271,11 +293,11 @@ class MultivariateNormalLinearOperator(
     else:
       variance = self.scale.matmul(self.scale.adjoint()).diag_part()
 
-    return tf.broadcast_to(
-        variance,
-        ps.broadcast_shape(
-            ps.shape(variance),
-            ps.shape(self.loc)))
+    if self.loc is not None:
+      variance = tf.broadcast_to(
+          variance, ps.broadcast_shape(ps.shape(variance), ps.shape(self.loc)))
+
+    return variance
 
   def _stddev(self):
     if distribution_util.is_diagonal_scale(self.scale):
@@ -289,20 +311,11 @@ class MultivariateNormalLinearOperator(
           tf.linalg.diag_part(
               self.scale.matmul(self.scale.to_dense(), adjoint_arg=True)))
 
-    shape = tensorshape_util.concatenate(self.batch_shape, self.event_shape)
-    has_static_shape = tensorshape_util.is_fully_defined(shape)
-    if not has_static_shape:
-      shape = tf.concat([
-          self.batch_shape_tensor(),
-          self.event_shape_tensor(),
-      ], 0)
+    if self.loc is not None:
+      stddev = tf.broadcast_to(
+          stddev, ps.broadcast_shape(ps.shape(stddev), ps.shape(self.loc)))
 
-    if has_static_shape and shape == stddev.shape:
-      return stddev
-
-    # Add dummy tensor of zeros to broadcast.  This is only necessary if shape
-    # != stddev.shape, but we could not determine if this is the case.
-    return stddev + tf.zeros(shape, self.dtype)
+    return stddev
 
   def _mode(self):
     return self._mean()

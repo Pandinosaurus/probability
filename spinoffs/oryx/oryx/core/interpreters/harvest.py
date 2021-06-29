@@ -334,7 +334,7 @@ class HarvestTrace(jax_core.Trace):
       # TODO(sharadmv): figure out if invars are mapped or unmapped
       params = params.copy()
       out_axes_thunk = params['out_axes_thunk']
-      @jax_util.as_hashable_function(key=('harvest', out_axes_thunk))
+      @jax_util.as_hashable_function(closure=('harvest', out_axes_thunk))
       def new_out_axes_thunk():
         out_axes = out_axes_thunk()
         assert all(out_axis == 0 for out_axis in out_axes)
@@ -487,7 +487,8 @@ nest_p = jax_core.CallPrimitive('nest')
 
 
 def _nest_impl(f, *args, **_):
-  return f.call_wrapped(*args)
+  with jax_core.new_sublevel():
+    return f.call_wrapped(*args)
 
 
 nest_p.def_impl(_nest_impl)

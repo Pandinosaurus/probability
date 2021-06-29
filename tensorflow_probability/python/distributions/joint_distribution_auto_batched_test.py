@@ -18,8 +18,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-
 import collections
+import os
 
 # Dependency imports
 from absl.testing import parameterized
@@ -36,6 +36,7 @@ tfb = tfp.bijectors
 tfd = tfp.distributions
 
 
+JAX_MODE = False
 Root = tfd.JointDistributionCoroutineAutoBatched.Root
 
 
@@ -202,8 +203,10 @@ class JointDistributionAutoBatchedTest(test_util.TestCase):
     # This model's broadcasting behavior is a footgun (it can break inference
     # routines and cause silently incorrect optimization); it should be
     # disallowed by `validate_args`.
-    with self.assertRaisesRegexp(Exception,
-                                 'Component batch shapes are inconsistent'):
+    with self.assertRaisesRegexp(
+        Exception,
+        ('Component batch shapes are inconsistent|'
+         'Broadcasting probably indicates an error in model specification')):
       jda_invalid = jda_class(jd_auto_models[jda_class],
                               batch_ndims=1, validate_args=True)
       _ = self.evaluate(jda_invalid.log_prob(
@@ -331,6 +334,66 @@ class JointDistributionAutoBatchedTest(test_util.TestCase):
 
     self.assertAllClose(*self.evaluate([log_prob, expected_log_prob]))
 
+  @parameterized.named_parameters(
+      {'testcase_name': 'coroutine',
+       'jd_class': tfd.JointDistributionCoroutineAutoBatched},
+      {'testcase_name': 'sequential',
+       'jd_class': tfd.JointDistributionSequentialAutoBatched},
+      {'testcase_name': 'named',
+       'jd_class': tfd.JointDistributionNamedAutoBatched})
+  def test_sample_and_log_prob(self, jd_class):
+
+    # Define a bijector to detect if/when `inverse` is called.
+    inverted_values = []
+
+    class InverseTracingExp(tfb.Exp):
+
+      def _inverse(self, y):
+        inverted_values.append(y)
+        return tf.math.log(y)
+
+    models = {}
+
+    def coroutine_model():
+      g = yield InverseTracingExp()(tfd.Normal(0., 1.), name='g')
+      df = yield tfd.Exponential(1., name='df')
+      loc = yield tfd.Sample(tfd.Normal(0, g), 20, name='loc')
+      yield tfd.StudentT(df, loc, 1, name='x')
+    models[tfd.JointDistributionCoroutineAutoBatched] = coroutine_model
+
+    models[tfd.JointDistributionSequentialAutoBatched] = [
+        InverseTracingExp()(tfd.Normal(0., 1.), name='g'),
+        tfd.Exponential(1., name='df'),
+        lambda _, g: tfd.Sample(tfd.Normal(0, g), 20, name='loc'),
+        lambda loc, df: tfd.StudentT(df, loc, 1, name='x')
+    ]
+
+    models[tfd.JointDistributionNamedAutoBatched] = collections.OrderedDict((
+        ('g', InverseTracingExp()(tfd.Normal(0., 1.))),
+        ('df', tfd.Exponential(1.)),
+        ('loc', lambda g: tfd.Sample(tfd.Normal(0, g), 20)),
+        ('x', lambda loc, df: tfd.StudentT(df, loc, 1))))
+
+    joint = jd_class(models[jd_class], validate_args=True)
+
+    for sample_shape in ([], [5]):
+      inverted_values.clear()
+      x1, lp1 = self.evaluate(
+          joint.experimental_sample_and_log_prob(
+              sample_shape,
+              seed=test_util.test_seed(sampler_type='seedless'),
+              df=2.7))  # Check that kwargs are supported.
+      x2 = self.evaluate(
+          joint.sample(sample_shape,
+                       seed=test_util.test_seed(sampler_type='seedless'),
+                       df=2.7))
+      self.assertAllCloseNested(x1, x2)
+
+      self.assertLen(inverted_values, 0)
+      lp2 = joint.log_prob(x1)
+      self.assertLen(inverted_values, 1)
+      self.assertAllClose(lp1, lp2)
+
   def test_sample_with_batch_value(self):
     @tfd.JointDistributionCoroutineAutoBatched
     def dist():
@@ -351,6 +414,20 @@ class JointDistributionAutoBatchedTest(test_util.TestCase):
     x = self.evaluate(dist.sample(123, seed=test_util.test_seed()))
     x2 = self.evaluate(dist.sample(value=x, seed=test_util.test_seed()))
     self.assertAllCloseNested(x, x2)
+
+  def test_sample_with_value_as_kwarg(self):
+    @tfd.JointDistributionCoroutineAutoBatched
+    def dist():
+      a = yield tfd.Sample(tfd.Normal(0, 1.), 2, name='a')
+      b = yield tfd.Sample(tfd.Normal(0, 1.), 3, name='b')
+      # The following line fails if not autovectorized.
+      yield tfd.Normal(a[tf.newaxis, ...] * b[..., tf.newaxis], 1., name='c')
+
+    x = self.evaluate(dist.sample(4, seed=test_util.test_seed()))
+    x2 = self.evaluate(dist.sample(seed=test_util.test_seed(), a=x.a))
+    self.assertAllClose(x.a, x2.a)
+    self.assertAllEqual(x2.b.shape, [4, 3])
+    self.assertAllEqual(x2.c.shape, [4, 3, 2])
 
   @parameterized.named_parameters(
       dict(testcase_name='stateful', sampler_type='stateful'),
@@ -444,6 +521,44 @@ class JointDistributionAutoBatchedTest(test_util.TestCase):
                             [value_partial_batch_dim, num_columns])
         self.assertAllEqual(xs[2].shape,
                             [value_partial_batch_dim, num_rows, num_columns])
+
+  def test_unit_sample_shape_avoids_vectorization(self):
+    xs = []  # Collect (possibly symbolic) Tensors sampled inside the model.
+    @tfd.JointDistributionCoroutineAutoBatched
+    def dist():
+      x = yield tfd.Normal(0., 1., name='x')
+      xs.append(x)
+
+    # Try sampling with a variety of unit sample shapes.
+    self.assertEqual(
+        [1],
+        dist.sample(
+            1, seed=test_util.test_seed(sampler_type='seedless')).x.shape)
+    self.assertEqual(
+        [1],
+        dist.sample([1],
+                    seed=test_util.test_seed(sampler_type='seedless')).x.shape)
+    self.assertEqual(
+        [1, 1],
+        dist.sample([1, 1],
+                    seed=test_util.test_seed(sampler_type='seedless')).x.shape)
+
+    # Check that the model only ever saw the trivial sample shape.
+    for x in xs:
+      self.assertEqual(x.shape, [])
+
+  def test_unit_sample_shape(self):
+    @tfd.JointDistributionCoroutineAutoBatched
+    def dist():
+      x = yield tfd.Normal(loc=tf.zeros([3]), scale=1., name='x')
+      yield tfd.Bernoulli(logits=tf.einsum('n->', x), name='y')
+
+    for sample_shape in [(), 1, [1], [1, 1], [2]]:
+      self.assertAllEqual(
+          dist.log_prob(
+              dist.sample(sample_shape,
+                          seed=test_util.test_seed())).shape,
+          np.reshape(sample_shape, [-1]))
 
   def test_sample_dtype_structures_output(self):
 
@@ -594,31 +709,73 @@ class JointDistributionAutoBatchedTest(test_util.TestCase):
 
     models = {}
     def coroutine_model():
-      g = yield tfd.LogNormal(0., [1., 2.])
-      df = yield tfd.Exponential([1., 2.])
-      loc = yield tfd.Sample(tfd.Normal(0, g), 20)
-      yield tfd.StudentT(tf.expand_dims(df, -1), loc, 1)
+      high = yield tfd.LogNormal(0., [1.])
+      yield tfd.Uniform(low=[[-1., -2.]], high=high[..., tf.newaxis])
+      yield tfd.Deterministic([[0., 1., 2.]])
     models[tfd.JointDistributionCoroutineAutoBatched] = coroutine_model
 
     models[tfd.JointDistributionSequentialAutoBatched] = [
-        tfd.LogNormal(0., [1., 2.]),
-        tfd.Exponential([1., 2.]),
-        lambda _, g: tfd.Sample(tfd.Normal(0, g), 20),
-        lambda loc, df: tfd.StudentT(tf.expand_dims(df, -1), loc, 1)
+        tfd.LogNormal(0., [1.]),
+        lambda high: tfd.Uniform(low=[[-1., -2.]], high=high[..., tf.newaxis]),
+        tfd.Deterministic([[0., 1., 2.]])
     ]
 
     models[tfd.JointDistributionNamedAutoBatched] = collections.OrderedDict((
-        ('g', tfd.LogNormal(0., [1., 2.])),
-        ('df', tfd.Exponential([1., 2.])),
-        ('loc', lambda g: tfd.Sample(tfd.Normal(0, g), 20)),
-        ('x', lambda loc, df: tfd.StudentT(tf.expand_dims(df, -1), loc, 1))))
+        ('high', tfd.LogNormal(0., [1.])),
+        ('x', lambda high: tfd.Uniform(low=[[-1., -2.]],  # pylint: disable=g-long-lambda
+                                       high=high[..., tf.newaxis])),
+        ('y', tfd.Deterministic([[0., 1., 2.]]))))
 
     joint = jd_class(models[jd_class], batch_ndims=1, validate_args=True)
+    self.assertAllEqual(joint.batch_shape, [1])
+    self.assertAllEqualNested(tf.nest.flatten(joint.event_shape),
+                              [[], [2], [3]])
     joint_bijector = joint.experimental_default_event_space_bijector()
-    x = self.evaluate(joint.sample(seed=test_util.test_seed()))
-    self.assertAllClose(
-        x,
-        self.evaluate(joint_bijector.forward(joint_bijector.inverse(x))))
+
+    y = self.evaluate(joint.sample([2, 3], seed=test_util.test_seed()))
+    x = joint_bijector.inverse(y)
+    self.assertAllCloseNested(y, joint_bijector.forward(x))
+
+    fldj = joint_bijector.forward_log_det_jacobian(
+        x, event_ndims=tf.nest.pack_sequence_as(joint.dtype, [0, 1, 2]))
+    ildj = joint_bijector.inverse_log_det_jacobian(
+        y, event_ndims=tf.nest.pack_sequence_as(joint.dtype, [0, 1, 1]))
+    self.assertAllEqual(fldj.shape, joint.log_prob(y).shape)
+    self.assertAllClose(fldj, -ildj)
+
+  @parameterized.named_parameters(
+      {'testcase_name': 'coroutine',
+       'jd_class': tfd.JointDistributionCoroutineAutoBatched},
+      {'testcase_name': 'sequential',
+       'jd_class': tfd.JointDistributionSequentialAutoBatched},
+      {'testcase_name': 'named',
+       'jd_class': tfd.JointDistributionNamedAutoBatched})
+  def test_default_event_space_bijector_constant_jacobian(self, jd_class):
+
+    models = {}
+    def coroutine_model():
+      yield tfd.Normal(0., [1., 2.], name='x')
+    models[tfd.JointDistributionCoroutineAutoBatched] = coroutine_model
+
+    models[tfd.JointDistributionSequentialAutoBatched] = [
+        tfd.Normal(0., [1., 2.], name='x')
+    ]
+
+    models[tfd.JointDistributionNamedAutoBatched] = {
+        'x': tfd.Normal(0., [1., 2.], name='x')}
+
+    joint = jd_class(models[jd_class], batch_ndims=1, validate_args=True)
+    self.assertAllEqual(joint.batch_shape, [2])
+    joint_bijector = joint.experimental_default_event_space_bijector()
+
+    y = self.evaluate(joint.sample([3], seed=test_util.test_seed()))
+    x = joint_bijector.inverse(y)
+    self.assertAllCloseNested(y, joint_bijector.forward(x))
+
+    fldj = joint_bijector.forward_log_det_jacobian(x)
+    ildj = joint_bijector.inverse_log_det_jacobian(y)
+    self.assertAllEqual(fldj.shape, joint.log_prob(y).shape)
+    self.assertAllClose(fldj, -ildj)
 
   def test_nested_joint_distributions(self):
     batch_shape = [2, 3]
@@ -646,10 +803,69 @@ class JointDistributionAutoBatchedTest(test_util.TestCase):
         joint.event_shape)
 
     # Sample shape.
-    z2 = joint.sample(5, seed=test_util.test_seed())
+    z2 = self.evaluate(
+        joint.sample(5, seed=test_util.test_seed()))
     lp2 = joint.log_prob(z2)
     self.assertAllEqual(lp2.shape, [5])
 
+    z3 = joint.sample(value=z2, seed=test_util.test_seed())
+    self.assertAllCloseNested(z2, z3)
+
+  @parameterized.named_parameters(*[
+      dict(testcase_name='_{}{}'.format(jd_class.__name__,  # pylint: disable=g-complex-comprehension
+                                        '_jit' if jit else ''),
+           jd_class=jd_class, jit=jit)
+      for jd_class in (tfd.JointDistributionCoroutineAutoBatched,
+                       tfd.JointDistributionSequentialAutoBatched,
+                       tfd.JointDistributionNamedAutoBatched)
+      for jit in (False, True)
+  ])
+  def test_kahan_precision(self, jd_class, jit):
+    maybe_jit = lambda f: f
+    if jit:
+      self.skip_if_no_xla()
+      if not JAX_MODE and not tf.test.is_gpu_available():
+        self.skipTest('b/179303849')
+      maybe_jit = tf.function(jit_compile=True)
+
+    def make_models(dtype):
+      models = {}
+      def mk_20k_poisson(log_rate):
+        return tfd.Poisson(log_rate=tf.broadcast_to(log_rate[..., tf.newaxis],
+                                                    log_rate.shape + (20_000,)))
+      def coroutine_model():
+        log_rate = yield tfd.Normal(0., dtype(.2), name='log_rate')
+        yield mk_20k_poisson(log_rate).copy(name='x')
+      models[tfd.JointDistributionCoroutineAutoBatched] = coroutine_model
+
+      models[tfd.JointDistributionSequentialAutoBatched] = [
+          tfd.Normal(0., dtype(.2)), mk_20k_poisson
+      ]
+
+      models[tfd.JointDistributionNamedAutoBatched] = collections.OrderedDict((
+          ('log_rate', tfd.Normal(0., dtype(.2))), ('x', mk_20k_poisson)))
+      return models
+
+    joint = jd_class(make_models(np.float32)[jd_class], validate_args=True,
+                     experimental_use_kahan_sum=True)
+    joint64 = jd_class(make_models(np.float64)[jd_class], validate_args=True)
+    stream = test_util.test_seed_stream()
+    nsamp = 7
+    xs = self.evaluate(
+        joint.sample(log_rate=tf.zeros([nsamp]), seed=stream()))
+    if isinstance(xs, dict):
+      xs['log_rate'] = tfd.Normal(0, .2).sample(nsamp, seed=stream())
+    else:
+      xs = (tfd.Normal(0, .2).sample(nsamp, seed=stream()), xs[1])
+    xs64 = tf.nest.map_structure(lambda x: tf.cast(x, tf.float64), xs)
+    lp = maybe_jit(joint.copy(validate_args=not jit).log_prob)(xs)
+    lp64 = joint64.log_prob(xs64)
+    lp, lp64 = self.evaluate((tf.cast(lp, tf.float64), lp64))
+    # Without Kahan, example max-abs-diff: ~0.06
+    self.assertAllClose(lp64, lp, rtol=0., atol=.01)
+
 
 if __name__ == '__main__':
+  # TODO(b/173158845): XLA:CPU reassociates away the Kahan correction term.
+  os.environ['XLA_FLAGS'] = '--xla_cpu_enable_fast_math=false'
   tf.test.main()

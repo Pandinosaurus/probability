@@ -14,19 +14,17 @@
 # ============================================================================
 """SinhArcsinh transformation of a distribution."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import tensorflow.compat.v2 as tf
-from tensorflow_probability.python.bijectors import affine_scalar as affine_scalar_bijector
 from tensorflow_probability.python.bijectors import chain as chain_bijector
 from tensorflow_probability.python.bijectors import identity as identity_bijector
+from tensorflow_probability.python.bijectors import scale as scale_bijector
+from tensorflow_probability.python.bijectors import shift as shift_bijector
 from tensorflow_probability.python.bijectors import sinh_arcsinh as sinh_arcsinh_bijector
+from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.distributions import normal
 from tensorflow_probability.python.distributions import transformed_distribution
-from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
 
 __all__ = [
@@ -160,15 +158,8 @@ class SinhArcsinh(transformed_distribution.TransformedDistribution):
       #   C := 2 / F_0(2)
       #   F_0(Z) := Sinh( Arcsinh(Z) * tailweight )
       if distribution is None:
-        batch_rank = tf.reduce_max([
-            distribution_util.prefer_static_rank(x)
-            for x in (self._skewness, self._tailweight, self._loc, self._scale)
-        ])
-        # TODO(b/160730249): Make `loc` a scalar `0.` and remove overridden
-        # `batch_shape` and `batch_shape_tensor` when
-        # TransformedDistribution's bijector can modify its `batch_shape`.
         distribution = normal.Normal(
-            loc=tf.zeros(tf.ones(batch_rank, tf.int32), dtype=dtype),
+            loc=tf.zeros([], dtype=dtype),
             scale=tf.ones([], dtype=dtype),
             allow_nan_stats=allow_nan_stats,
             validate_args=validate_args)
@@ -178,12 +169,9 @@ class SinhArcsinh(transformed_distribution.TransformedDistribution):
           skewness=self._skewness, tailweight=self._tailweight,
           validate_args=validate_args)
 
-      # Make the AffineScalar bijector, Z --> loc + scale * Z (2 / F_0(2))
-      affine = affine_scalar_bijector.AffineScalar(
-          shift=self._loc,
-          scale=self._scale,
-          validate_args=validate_args)
-
+      # Make the affine scalar bijector, Z --> loc + scale * Z (2 / F_0(2))
+      affine = shift_bijector.Shift(shift=self._loc)(
+          scale_bijector.Scale(scale=self._scale))
       bijector = chain_bijector.Chain([affine, f])
 
       super(SinhArcsinh, self).__init__(
@@ -192,6 +180,18 @@ class SinhArcsinh(transformed_distribution.TransformedDistribution):
           validate_args=validate_args,
           name=name)
       self._parameters = parameters
+
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    return dict(
+        loc=parameter_properties.ParameterProperties(),
+        scale=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
+        skewness=parameter_properties.ParameterProperties(),
+        tailweight=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))))
 
   @property
   def loc(self):
@@ -213,16 +213,7 @@ class SinhArcsinh(transformed_distribution.TransformedDistribution):
     """Controls the skewness.  `Skewness > 0` means right skew."""
     return self._skewness
 
-  def _batch_shape(self):
-    params = [self.skewness, self.tailweight, self.loc, self.scale]
-    s_shape = params[0].shape
-    for t in params[1:]:
-      s_shape = tf.broadcast_static_shape(s_shape, t.shape)
-    return s_shape
-
-  def _batch_shape_tensor(self):
-    return distribution_util.get_broadcast_shape(
-        self.skewness, self.tailweight, self.loc, self.scale)
+  experimental_is_sharded = False
 
   def _default_event_space_bijector(self):
     # TODO(b/145620027) Finalize choice of bijector.

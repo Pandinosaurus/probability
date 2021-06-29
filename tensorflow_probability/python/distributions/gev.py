@@ -25,16 +25,19 @@ import tensorflow.compat.v2 as tf
 from tensorflow_probability.python.bijectors import gev_cdf as gev_cdf_bijector
 from tensorflow_probability.python.bijectors import invert as invert_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import transformed_distribution
 from tensorflow_probability.python.distributions import uniform
-from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import tensor_util
 
 
-class GeneralizedExtremeValue(transformed_distribution.TransformedDistribution):
+# TODO(b/182603117): Remove `AutoCompositeTensor` subclass when
+# `TransformedDistribution` is converted to `CompositeTensor`.
+class GeneralizedExtremeValue(transformed_distribution.TransformedDistribution,
+                              distribution.AutoCompositeTensorDistribution):
   """The scalar GeneralizedExtremeValue distribution.
 
   This distribution is a common choice for modeling the maximum value of a
@@ -158,18 +161,14 @@ class GeneralizedExtremeValue(transformed_distribution.TransformedDistribution):
           loc=loc, scale=scale, concentration=concentration,
           validate_args=validate_args)
 
-      batch_shape = distribution_util.get_broadcast_shape(loc, scale,
-                                                          concentration)
       # Because the uniform sampler generates samples in `[0, 1)` this would
       # cause samples to lie in `(inf, -inf]` instead of `(inf, -inf)`. To fix
       # this, we use `np.finfo(dtype_util.as_numpy_dtype(self.dtype).tiny`
       # because it is the smallest, positive, 'normal' number.
       super(GeneralizedExtremeValue, self).__init__(
-          # TODO(b/137665504): Use batch-adding meta-distribution to set the
-          # batch shape instead of tf.ones.
           distribution=uniform.Uniform(
               low=np.finfo(dtype_util.as_numpy_dtype(dtype)).tiny,
-              high=tf.ones(batch_shape, dtype=dtype),
+              high=tf.ones([], dtype=dtype),
               allow_nan_stats=allow_nan_stats),
           # The GEV bijector encodes the CDF function as the forward,
           # and hence needs to be inverted.
@@ -204,6 +203,8 @@ class GeneralizedExtremeValue(transformed_distribution.TransformedDistribution):
     """Distribution parameter for shape."""
     return self._gev_bijector.concentration
 
+  experimental_is_sharded = False
+
   def _entropy(self):
     scale = tf.broadcast_to(self.scale,
                             ps.broadcast_shape(ps.shape(self.scale),
@@ -222,7 +223,10 @@ class GeneralizedExtremeValue(transformed_distribution.TransformedDistribution):
       log_t = tf.where(equal_zero, -z,
                        -tf.math.log1p(z * safe_conc) / safe_conc)
 
-      return (conc + 1) * log_t - tf.exp(log_t) - tf.math.log(scale)
+      result = (conc + 1) * log_t - tf.exp(log_t) - tf.math.log(scale)
+      return tf.where(z * safe_conc <= -1.0,
+                      tf.constant(-np.inf, dtype=result.dtype),
+                      result)
 
   def _mean(self):
     conc = tf.convert_to_tensor(self.concentration)

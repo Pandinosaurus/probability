@@ -53,6 +53,7 @@ __all__ = ["LinearOperatorToeplitz",]
 
 
 # @tf_export("linalg.LinearOperatorToeplitz")
+# @linear_operator.make_composite_tensor
 class LinearOperatorToeplitz(linear_operator.LinearOperator):
   """`LinearOperator` acting like a [batch] of toeplitz matrices.
 
@@ -178,7 +179,6 @@ class LinearOperatorToeplitz(linear_operator.LinearOperator):
 
       super(LinearOperatorToeplitz, self).__init__(
           dtype=self._row.dtype,
-          graph_parents=None,
           is_non_singular=is_non_singular,
           is_self_adjoint=is_self_adjoint,
           is_positive_definite=is_positive_definite,
@@ -284,9 +284,9 @@ class LinearOperatorToeplitz(linear_operator.LinearOperator):
     # We construct these set of indices below.
     indices = math_ops.mod(
         # How much to shift right. This corresponds to `i`.
-        math_ops.range(0, n) +
+        array_ops.range(0, n) +
         # Specifies the last `n` indices.
-        math_ops.range(n - 1, -1, -1)[..., _ops.newaxis],
+        array_ops.range(n - 1, -1, -1)[..., _ops.newaxis],
         # Mod out by the total number of elements to ensure the index is
         # non-negative (for tf.gather) and < 2 * n - 1.
         2 * n - 1)
@@ -299,6 +299,10 @@ class LinearOperatorToeplitz(linear_operator.LinearOperator):
   @property
   def row(self):
     return self._row
+
+  @property
+  def _composite_tensor_fields(self):
+    return ("col", "row")
 
 
 def _to_complex(x):

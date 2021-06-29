@@ -25,6 +25,7 @@ from tensorflow_probability.python.bijectors import shift as shift_bijector
 from tensorflow_probability.python.bijectors import sigmoid as sigmoid_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
 
 
@@ -33,7 +34,7 @@ __all__ = [
 ]
 
 
-class GeneralizedPareto(bijector_lib.Bijector):
+class GeneralizedPareto(bijector_lib.AutoCompositeTensorBijector):
   """Bijector mapping R**n to non-negative reals.
 
   Forward computation maps R**n to the support of the `GeneralizedPareto`
@@ -46,7 +47,7 @@ class GeneralizedPareto(bijector_lib.Bijector):
   `x >= loc`                                             if `concentration >= 0`
   `x >= loc` and `x <= loc + scale / abs(concentration)` if `concentration < 0`
 
-  This bijector is used as the `_experimental_default_event_space_bijector` of
+  This bijector is used as the `experimental_default_event_space_bijector` of
   the `GeneralizedPareto` distribution.
 
   """
@@ -76,6 +77,17 @@ class GeneralizedPareto(bijector_lib.Bijector):
           parameters=parameters,
           name=name)
 
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict(
+        loc=parameter_properties.ParameterProperties(),
+        scale=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
+        concentration=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))))
+
   def _is_increasing(self):
     return True
 
@@ -94,9 +106,10 @@ class GeneralizedPareto(bijector_lib.Bijector):
   def _negative_concentration_bijector(self):
     # Constructed dynamically so that `loc + scale / concentration` is
     # tape-safe.
-    high = self.loc + tf.math.abs(self.scale / self.concentration)
+    loc = tf.convert_to_tensor(self.loc)
+    high = loc + tf.math.abs(self.scale / self.concentration)
     return sigmoid_bijector.Sigmoid(
-        low=self.loc, high=high, validate_args=self.validate_args)
+        low=loc, high=high, validate_args=self.validate_args)
 
   def _forward(self, x):
     return tf.where(self._concentration < 0.,

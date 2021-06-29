@@ -58,7 +58,7 @@ def trace_jacobian_hutchinson(
       Default value: `tf.random.normal`
     num_samples: `Integer` number of random samples to use for trace estimation.
       Default value: '1'
-    seed: 'Integer' seed for random number generator.
+    seed: PRNG seed compatible with `sample_fn`.
 
   Returns:
     augmented_ode_fn: `Callable(time, (state, log_det_jac))` that computes
@@ -327,6 +327,10 @@ class FFJORD(bijector.Bijector):
           validate_args=validate_args,
           parameters=parameters,
           name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict()
 
   def _solve_ode(self, ode_fn, state):
     """Solves the initial value problem defined by `ode_fn`.

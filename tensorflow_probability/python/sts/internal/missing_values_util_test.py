@@ -40,7 +40,7 @@ class _MissingValuesUtilityTests(test_util.TestCase):
 
     mean, variance = missing_values_util.moments_of_masked_time_series(
         self._build_tensor(series),
-        broadcast_mask=self._build_tensor(mask, dtype=np.bool))
+        broadcast_mask=self._build_tensor(mask, dtype=np.bool_))
 
     mean_, variance_ = self.evaluate((mean, variance))
     self.assertAllClose(mean_, expected_mean)
@@ -51,14 +51,16 @@ class _MissingValuesUtilityTests(test_util.TestCase):
     if not self.use_static_shape:
       return  # Dynamic rank is not currently supported.
 
-    series = np.random.randn(2, 4)
+    series = np.random.randn(3, 4)
     mask = np.array([[False, True, False, True],
-                     [True, False, True, False]])
-    expected_initial_values = [series[0, 0], series[1, 1]]
+                     [True, False, True, False],
+                     # Ensure no error if a batch element is fully masked.
+                     [True, True, True, True]])
+    expected_initial_values = [series[0, 0], series[1, 1], series[2, 3]]
 
     initial_values = missing_values_util.initial_value_of_masked_time_series(
         self._build_tensor(series),
-        broadcast_mask=self._build_tensor(mask, dtype=np.bool))
+        broadcast_mask=self._build_tensor(mask, dtype=np.bool_))
 
     self.assertAllClose(self.evaluate(initial_values), expected_initial_values)
 

@@ -86,6 +86,9 @@ class _NullContext(object):
 
 def _broadcast_static_shape(shape_x, shape_y):
   """Reimplements `tf.broadcast_static_shape` in JAX/NumPy."""
+  if (tensor_shape.TensorShape(shape_x).ndims is None or
+      tensor_shape.TensorShape(shape_y).ndims is None):
+    return tensor_shape.TensorShape(None)
   shape_x = tuple(tensor_shape.TensorShape(shape_x).as_list())
   shape_y = tuple(tensor_shape.TensorShape(shape_y).as_list())
   try:
@@ -173,7 +176,7 @@ def _infer_dtype(value, default_dtype):
     # Duck-typing onp types
     return value.dtype
   elif isinstance(value, bool):
-    return np.bool
+    return np.bool_
   elif isinstance(value, six.integer_types):
     return np.int32
   elif isinstance(value, float):
@@ -282,7 +285,7 @@ def _default_convert_to_tensor_with_dtype(value, dtype,
   elif isinstance(value, bool):
     # Bool check needs to happen before int check because bools are instances of
     # int.
-    dtype_compatible = (dtype == np.bool or np.issubdtype(dtype, np.integer)
+    dtype_compatible = (dtype == np.bool_ or np.issubdtype(dtype, np.integer)
                         or np.issubdtype(dtype, np.floating))
     if not dtype_compatible:
       if error_if_mismatch:
@@ -294,7 +297,7 @@ def _default_convert_to_tensor_with_dtype(value, dtype,
       raise MixedTypesError()
     if dtype == np.int32 and _is_int64(value):
       raise _Int64ToInt32Error(np.array(value, dtype=dtype))
-    if dtype == np.bool:
+    if dtype == np.bool_:
       # Can't downcast an int to a bool
       raise TypeConversionError(value, dtype)
   elif isinstance(value, float):
@@ -408,22 +411,17 @@ def _custom_gradient(f):
   if not JAX_MODE:
     # Numpy backend ignores custom gradients, so we do too.
     return lambda *args, **kwargs: f(*args, **kwargs)[0]
-  def f_(*args, **kwargs):
+
+  @jax.custom_gradient
+  @functools.wraps(f)
+  def wrapped(*args, **kwargs):
     value, vjp = f(*args, **kwargs)
     def vjp_(cts_out):
       cts_in = vjp(cts_out)
       if isinstance(cts_in, list):
         cts_in = tuple(cts_in)
-      elif not isinstance(cts_in, tuple):
-        cts_in = (cts_in,)
       return cts_in
     return value, vjp_
-  @jax.custom_transforms
-  @functools.wraps(f)
-  def wrapped(*args, **kwargs):
-    value, _ = f(*args, **kwargs)
-    return value
-  jax.defvjp_all(wrapped, f_)
   return wrapped
 
 custom_gradient = utils.copy_docstring(

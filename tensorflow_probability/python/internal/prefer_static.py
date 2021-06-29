@@ -137,7 +137,8 @@ def _convert_to_shape_tensor_jax(value, dtype=None, dtype_hint=None, name=None):
   """Converts vectors and scalars of `int`-like to `ndarray`."""
   dtype = dtype_util.as_numpy_dtype(dtype or dtype_hint or np.int32)
   try:
-    return np.array([int(v) for v in value], dtype=dtype)
+    return np.array([_convert_to_shape_tensor_jax(v, dtype) for v in value],
+                    dtype=dtype)
   except:  # JAX throws raw Exception in some cases.  # pylint: disable=bare-except
     pass
   return np.array(int(value), dtype=dtype)
@@ -205,7 +206,7 @@ def broadcast_shape(x_shape, y_shape):
   computed statically and returned as a `TensorShape`.  Otherwise, a rank-1
   `Tensor` will be returned.
 
-  Arguments:
+  Args:
     x_shape: A `TensorShape` or rank-1 integer `Tensor`.  The input `Tensor` is
       broadcast against this shape.
     y_shape: A `TensorShape` or rank-1 integer `Tensor`.  The input `Tensor` is
@@ -230,7 +231,7 @@ def cond(pred, true_fn=None, false_fn=None, name=None):
   If `pred` is a bool or has a constant value, we return either `true_fn()`
   or `false_fn()`, otherwise we use `tf.cond` to dynamically route to both.
 
-  Arguments:
+  Args:
     pred: A scalar determining whether to return the result of `true_fn` or
       `false_fn`.
     true_fn: The callable to be performed if pred is true.
@@ -320,7 +321,7 @@ def _ones_like(input, dtype=None, name=None):  # pylint: disable=redefined-built
   s_ = tf.get_static_value(s)
   if s_ is not None:
     return np.ones(s_, dtype_util.as_numpy_dtype(dtype or input.dtype))
-  return tf.ones(s, dtype or s.dtype, name)
+  return tf.ones(s, dtype or input.dtype, name)
 ones_like = _copy_docstring(tf.ones_like, _ones_like)
 
 
@@ -329,7 +330,7 @@ def _rank(input, name=None):  # pylint: disable=redefined-builtin,unused-argumen
     input = (tf.convert_to_tensor(input) if tf.get_static_value(input) is None
              else np.array(input))
   ndims_ = tensorshape_util.rank(getattr(input, 'shape', None))
-  return tf.rank(input) if ndims_ is None else np.int32(ndims_)
+  return tf.rank(input) if ndims_ is None else np.array(ndims_, np.int32)
 rank = _copy_docstring(
     tf.rank,
     _rank)
@@ -365,7 +366,7 @@ setdiff1d = _copy_docstring(
 def _size(input, out_type=tf.int32, name=None):  # pylint: disable=redefined-builtin
   if not hasattr(input, 'shape'):
     x = np.array(input)
-    input = tf.convert_to_tensor(input) if x.dtype is np.object else x
+    input = tf.convert_to_tensor(input) if x.dtype is np.object_ else x
   n = tensorshape_util.num_elements(tf.TensorShape(input.shape))
   if n is None:
     return tf.size(input, out_type=out_type, name=name)
@@ -376,10 +377,9 @@ size = _copy_docstring(tf.size, _size)
 def _shape(input, out_type=tf.int32, name=None):  # pylint: disable=redefined-builtin,missing-docstring
   if not hasattr(input, 'shape'):
     x = np.array(input)
-    input = tf.convert_to_tensor(input) if x.dtype is np.object else x
-  input_shape = tf.TensorShape(input.shape)
+    input = tf.convert_to_tensor(input) if x.dtype is np.object_ else x
   if tensorshape_util.is_fully_defined(input.shape):
-    return np.array(tensorshape_util.as_list(input_shape)).astype(
+    return np.array(tensorshape_util.as_list(input.shape)).astype(
         _numpy_dtype(out_type))
   # NOTE: tf.shape(x) can call `tf.convert_to_tensor(x)` **twice**, so we
   # pre-emptively convert-to-tensor.
@@ -433,14 +433,17 @@ broadcast_to = _prefer_static(tf.broadcast_to, nptf.broadcast_to)
 cast = _prefer_static(tf.cast, nptf.cast)
 ceil = _prefer_static(tf.math.ceil, nptf.math.ceil)
 concat = _prefer_static(tf.concat, nptf.concat)
-convert_to_shape_tensor = _prefer_static(
-    tf.convert_to_tensor,
-    _convert_to_shape_tensor_jax if JAX_MODE else tf.convert_to_tensor)
+convert_to_shape_tensor = (
+    _prefer_static(tf.convert_to_tensor, _convert_to_shape_tensor_jax)
+    if JAX_MODE else tf.convert_to_tensor)
+constant = _prefer_static(tf.constant, nptf.constant)
 cumprod = _prefer_static(tf.math.cumprod, nptf.math.cumprod)
 cumsum = _prefer_static(tf.math.cumsum, nptf.math.cumsum)
 equal = _prefer_static(tf.equal, nptf.equal)
+not_equal = _prefer_static(tf.not_equal, nptf.not_equal)
 expm1 = _prefer_static(tf.math.expm1, nptf.math.expm1)
 floor = _prefer_static(tf.math.floor, nptf.math.floor)
+fill = _prefer_static(tf.fill, nptf.fill)
 gather = _prefer_static(tf.gather, nptf.gather)
 greater = _prefer_static(tf.greater, nptf.greater)
 identity = _prefer_static(tf.identity, nptf.identity)
@@ -471,6 +474,7 @@ reduce_min = _prefer_static(tf.reduce_min, nptf.reduce_min)
 reduce_prod = _prefer_static(tf.reduce_prod, nptf.reduce_prod)
 reduce_sum = _prefer_static(tf.reduce_sum, nptf.reduce_sum)
 reshape = _prefer_static(tf.reshape, nptf.reshape)
+reverse = _prefer_static(tf.reverse, nptf.reverse)
 round = _prefer_static(tf.math.round, nptf.math.round)  # pylint: disable=redefined-builtin
 rsqrt = _prefer_static(tf.math.rsqrt, nptf.math.rsqrt)
 slice = _prefer_static(tf.slice, nptf.slice)  # pylint: disable=redefined-builtin

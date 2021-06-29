@@ -24,11 +24,11 @@ from tensorflow_probability.python.bijectors import bijector
 
 
 __all__ = [
-    "Sinh",
+    'Sinh',
 ]
 
 
-class Sinh(bijector.Bijector):
+class Sinh(bijector.AutoCompositeTensorBijector):
   """Bijector that computes `Y = sinh(X)`.
 
   #### Examples
@@ -42,7 +42,7 @@ class Sinh(bijector.Bijector):
   ```
   """
 
-  def __init__(self, validate_args=False, name="sinh"):
+  def __init__(self, validate_args=False, name='sinh'):
     parameters = dict(locals())
     with tf.name_scope(name) as name:
       super(Sinh, self).__init__(
@@ -54,6 +54,10 @@ class Sinh(bijector.Bijector):
   @classmethod
   def _is_increasing(cls):
     return True
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict()
 
   def _forward(self, x):
     return tf.sinh(x)

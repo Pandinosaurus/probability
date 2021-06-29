@@ -170,7 +170,7 @@ class MetropolisHastings(kernel_base.TransitionKernel):
       previous_kernel_results: A (possibly nested) `tuple`, `namedtuple` or
         `list` of `Tensor`s representing internal calculations made within the
         previous call to this function (or as returned by `bootstrap_results`).
-      seed: Optional, a seed for reproducible sampling.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
     Returns:
       next_state: `Tensor` or Python `list` of `Tensor`s representing the
@@ -196,6 +196,8 @@ class MetropolisHastings(kernel_base.TransitionKernel):
           current_state,
           previous_kernel_results.accepted_results,
           **inner_kwargs)
+      if mcmc_util.is_list_like(current_state):
+        proposed_state = tf.nest.pack_sequence_as(current_state, proposed_state)
 
       if (not has_target_log_prob(proposed_results) or
           not has_target_log_prob(previous_kernel_results.accepted_results)):
@@ -288,6 +290,15 @@ class MetropolisHastings(kernel_base.TransitionKernel):
           # Allow room for one_step's seed.
           seed=samplers.zeros_seed(),
       )
+
+  @property
+  def experimental_shard_axis_names(self):
+    return self.inner_kernel.experimental_shard_axis_names
+
+  def experimental_with_shard_axes(self, shard_axis_names):
+    return self.copy(
+        inner_kernel=self.inner_kernel.experimental_with_shard_axes(
+            shard_axis_names))
 
 
 def has_target_log_prob(kernel_results):

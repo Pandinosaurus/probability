@@ -22,6 +22,7 @@ import numpy as np
 import tensorflow.compat.v2 as tf
 from tensorflow_probability.python.bijectors import exp as exp_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import kullback_leibler
 from tensorflow_probability.python.distributions import normal
 from tensorflow_probability.python.distributions import transformed_distribution
@@ -34,7 +35,10 @@ __all__ = [
 ]
 
 
-class LogNormal(transformed_distribution.TransformedDistribution):
+# TODO(b/182603117): Remove `AutoCompositeTensor` subclass when
+# `TransformedDistribution` is converted to `CompositeTensor`.
+class LogNormal(transformed_distribution.TransformedDistribution,
+                distribution.AutoCompositeTensorDistribution):
   """The log-normal distribution."""
 
   def __init__(self,
@@ -92,6 +96,20 @@ class LogNormal(transformed_distribution.TransformedDistribution):
   def scale(self):
     """Distribution parameter for the pre-transformed standard deviation."""
     return self.distribution.scale
+
+  experimental_is_sharded = False
+
+  def _log_prob(self, x):
+    answer = super(LogNormal, self)._log_prob(x)
+    # The formula inherited from TransformedDistribution computes `nan` for `x
+    # == 0`.  However, there's hope that it's not too inaccurate for small
+    # finite `x`, because `x` only appears as `log(x)`, and `log` is effectively
+    # discontinuous at 0.  Furthermore, the result should be dominated by the
+    # `log(x)**2` term, with no higher-order term that needs to be cancelled
+    # numerically.
+    return tf.where(tf.equal(x, 0.0),
+                    tf.constant(-np.inf, dtype=answer.dtype),
+                    answer)
 
   def _mean(self):
     return tf.exp(self.distribution.mean() + 0.5 * self.distribution.variance())

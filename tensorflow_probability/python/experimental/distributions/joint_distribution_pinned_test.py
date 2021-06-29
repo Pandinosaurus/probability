@@ -15,6 +15,7 @@
 """Tests for JointDistributionPinned."""
 
 import collections
+import functools
 
 from absl.testing import parameterized
 
@@ -25,9 +26,12 @@ import tensorflow_probability as tfp
 from tensorflow_probability.python.internal import structural_tuple
 from tensorflow_probability.python.internal import test_util
 
+from tensorflow.python import tf2  # pylint: disable=g-direct-tensorflow-import
 
+tfb = tfp.bijectors
 tfd = tfp.distributions
 tfde = tfp.experimental.distributions
+Root = tfd.JointDistributionCoroutine.Root
 
 
 def part_dists():
@@ -55,13 +59,36 @@ def jd_coroutine():
   return model
 
 
+def jd_coroutine_autobatched():
+  d0, d1, d2, d3 = part_dists()
+
+  root = tfd.JointDistributionCoroutineAutoBatched.Root
+  @tfd.JointDistributionCoroutineAutoBatched
+  def model():
+    w = yield root(d0)
+    x = yield root(d1)
+    y = yield d2(x)
+    yield d3(y, x, w)
+  return model
+
+
 def jd_sequential(model_from_seq=tuple):
   return tfd.JointDistributionSequential(model_from_seq(part_dists()))
+
+
+def jd_sequential_autobatched(model_from_seq=tuple):
+  return tfd.JointDistributionSequentialAutoBatched(
+      model_from_seq(part_dists()))
 
 
 def jd_named():
   d0, d1, d2, d3 = part_dists()
   return tfd.JointDistributionNamed(dict(w=d0, x=d1, y=d2, z=d3))
+
+
+def jd_named_autobatched():
+  d0, d1, d2, d3 = part_dists()
+  return tfd.JointDistributionNamedAutoBatched(dict(w=d0, x=d1, y=d2, z=d3))
 
 
 def jd_named_ordered():
@@ -82,8 +109,10 @@ def jd_named_namedtuple():
                                          '_'.join(map(str, sample_shape))),
            jd_factory=jd_factory,
            sample_shape=sample_shape)
-      for jd_factory in (jd_coroutine, jd_sequential, jd_named,
-                         jd_named_ordered, jd_named_namedtuple)
+      for jd_factory in (jd_coroutine, jd_coroutine_autobatched, jd_sequential,
+                         jd_sequential_autobatched, jd_named,
+                         jd_named_autobatched, jd_named_ordered,
+                         jd_named_namedtuple)
       # TODO(b/168139745): Add support for: [13], [13, 1], [1, 13]
       for sample_shape in ([],)))
 class JointDistributionPinnedParameterizedTest(test_util.TestCase):
@@ -95,7 +124,7 @@ class JointDistributionPinnedParameterizedTest(test_util.TestCase):
     underlying = jd_factory()
 
     tuple_args = (None, x,), (None, x, None, None), (None, x, None, z)
-    if jd_factory is jd_named:
+    if jd_factory is jd_named or jd_factory is jd_named_autobatched:
       # JDNamed does not support unnamed args unless model is ordered.
       for args in tuple_args:
         with self.assertRaisesRegexp(ValueError, r'unordered'):
@@ -129,7 +158,8 @@ class JointDistributionPinnedParameterizedTest(test_util.TestCase):
       self._check_pinning(pinned, sample_shape)
 
   def _check_pinning(self, pinned, sample_shape):
-    self.evaluate(pinned.event_shape_tensor())
+    self.evaluate(tf.nest.map_structure(tf.convert_to_tensor,
+                                        pinned.event_shape_tensor()))
 
     s0 = pinned.sample_unpinned(
         sample_shape, seed=test_util.test_seed(sampler_type='stateless'))
@@ -368,6 +398,82 @@ class JointDistributionPinnedTest(test_util.TestCase):
         lambda shp: tf.random.uniform(shp, -2., 2., seed=test_util.test_seed()),
         bij0.inverse_event_shape(pinned0.event_shape)))
     self.assertAllCloseNested(bij0.forward(init), bij1.forward(init))
+
+  @test_util.numpy_disable_test_missing_functionality('vectorized_map')
+  @parameterized.named_parameters(
+      ('scalar_scalar', [], []),
+      ('scalar_batch', [], [4]),
+      ('batch_scalar', [3], []),
+      ('batch_batch', [3], [4]))
+  def test_bijector_for_autobatched_model(self, pin_batch_shape, sample_shape):
+    if not tf2.enabled():
+      self.skipTest('b/183994961')
+
+    @tfd.JointDistributionCoroutineAutoBatched
+    def model():
+      a = yield tfd.Normal(0., 1., name='a')
+      yield tfd.Uniform(low=0., high=tf.exp(a * tf.ones([2])), name='b')
+
+    pinned = tfde.JointDistributionPinned(
+        model,
+        a=tf.random.stateless_normal(
+            pin_batch_shape,
+            seed=test_util.test_seed(sampler_type='stateless')))
+    ys = self.evaluate(
+        pinned.sample_unpinned(
+            sample_shape,
+            seed=test_util.test_seed(sampler_type='stateless')))
+    bij = pinned.experimental_default_event_space_bijector()
+    self.assertAllCloseNested(
+        ys,
+        bij.forward(
+            tf.nest.map_structure(
+                tf.identity,  # Bypass bijector cache.
+                bij.inverse(ys))))
+
+  def test_str(self):
+    @tfd.JointDistributionCoroutine
+    def model():
+      x = yield Root(tfd.MultivariateNormalDiag(
+          tf.zeros([10, 3]), tf.ones(3), name='x'))
+      yield tfd.Multinomial(
+          logits=tfb.Pad([[0, 1]])(x), total_count=13, name='y')
+
+    self.assertEqual('tfp.distributions.JointDistributionPinned('
+                     '"PinnedJointDistributionCoroutine", '
+                     'batch_shape=StructTuple(\n  x=[10]\n), '
+                     'event_shape=StructTuple(\n  x=[3]\n), '
+                     'dtype=StructTuple(\n  x=float32\n))',
+                     str(tfde.JointDistributionPinned(
+                         model, y=tf.zeros([10, 4]))))
+
+    @functools.partial(tfd.JointDistributionCoroutineAutoBatched, batch_ndims=1)
+    def model_ab():
+      x = yield Root(tfd.MultivariateNormalDiag(
+          tf.zeros([10, 3]), tf.ones(3), name='x'))
+      yield tfd.Multinomial(
+          logits=tfb.Pad([[0, 1]])(x), total_count=13, name='y')
+
+    self.assertEqual('tfp.distributions.JointDistributionPinned('
+                     '"PinnedJointDistributionCoroutineAutoBatched", '
+                     'batch_shape=[10], '
+                     'event_shape=StructTuple(\n  x=[3]\n), '
+                     'dtype=StructTuple(\n  x=float32\n))',
+                     str(tfde.JointDistributionPinned(
+                         model_ab, y=tf.zeros([10, 4]))))
+
+  def test_log_prob_parts_with_improper_base_dists(self):
+    root = tfd.JointDistributionCoroutine.Root
+    @tfd.JointDistributionCoroutine
+    def model():
+      x = yield root(tfd.Normal(0., 1., name='x'))
+      yield tfde.IncrementLogProb(tfd.Normal(x, 2.).log_prob(0.), name='y')
+
+    p = model.experimental_pin(y=tf.zeros([1, 0]))
+
+    parts = p.unnormalized_log_prob_parts(x=2.)
+    self.assertAllCloseNested(tfd.Normal(0., 1.).log_prob(2.), parts.unpinned.x)
+    self.assertAllCloseNested(tfd.Normal(2., 2.).log_prob(0.), parts.pinned.y)
 
 
 if __name__ == '__main__':

@@ -42,7 +42,7 @@ from tensorflow_probability.python.math.gradient import value_and_gradient
 __all__ = ['VonMises']
 
 
-class VonMises(distribution.Distribution):
+class VonMises(distribution.AutoCompositeTensorDistribution):
   """The von Mises distribution over angles.
 
   The von Mises distribution is a univariate directional distribution.
@@ -169,15 +169,6 @@ class VonMises(distribution.Distribution):
   def concentration(self):
     """Distribution parameter for the concentration."""
     return self._concentration
-
-  def _batch_shape_tensor(self, loc=None, concentration=None):
-    return ps.broadcast_shape(
-        ps.shape(self.loc if loc is None else loc),
-        ps.shape(self.concentration if concentration is None
-                 else concentration))
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(self.loc.shape, self.concentration.shape)
 
   def _event_shape_tensor(self):
     return tf.constant([], dtype=tf.int32)
@@ -371,7 +362,7 @@ def von_mises_cdf(x, concentration):
   using automatic differentiation. We use forward mode for the series case
   (which allows to save memory) and backward mode for the Normal approximation.
 
-  Arguments:
+  Args:
     x: The point at which to evaluate the CDF.
     concentration: The concentration parameter of the von Mises distribution.
 
@@ -498,10 +489,10 @@ def _von_mises_cdf_normal(x, concentration, dtype):
 def _von_mises_sample_no_gradient(shape, concentration, seed):
   """Performs rejection sampling for standardized von Mises.
 
-  Arguments:
+  Args:
     shape: The output sample shape.
     concentration: The concentration parameter of the distribution.
-    seed: The random seed.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
   Returns:
     samples: Samples of standardized von Mises.
@@ -591,7 +582,7 @@ def _von_mises_sample_fwd(shape, concentration, seed):
   return samples, (concentration, samples)
 
 
-def _von_mises_sample_bwd(aux, dy):
+def _von_mises_sample_bwd(_, aux, dy):
   """The gradient of the von Mises samples w.r.t. concentration."""
   concentration, samples = aux
   broadcast_concentration = tf.broadcast_to(concentration, ps.shape(samples))
@@ -641,10 +632,10 @@ def _von_mises_sample_jvp(shape, primals, tangents):
 def _von_mises_sample_with_gradient(shape, concentration, seed):
   """Performs rejection sampling for standardized von Mises.
 
-  Arguments:
+  Args:
     shape: The output sample shape.
     concentration: The concentration parameter of the distribution.
-    seed: (optional) The random seed.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
   Returns:
     sample: Differentiable samples of standardized von Mises.
@@ -662,11 +653,11 @@ def random_von_mises(shape, concentration, dtype=tf.float32, seed=None):
   The sampling algorithm is rejection sampling with wrapped Cauchy proposal [1].
   The samples are pathwise differentiable using the approach of [2].
 
-  Arguments:
+  Args:
     shape: The output sample shape.
     concentration: The concentration parameter of the von Mises distribution.
     dtype: The data type of concentration and the outputs.
-    seed: (optional) The random seed.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
   Returns:
     Differentiable samples of standardized von Mises.

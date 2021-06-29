@@ -28,7 +28,7 @@ __all__ = [
 ]
 
 
-class Inline(bijector.Bijector):
+class Inline(bijector.AutoCompositeTensorBijector):
   """Bijector constructed from custom callables.
 
   Example Use:
@@ -131,6 +131,10 @@ class Inline(bijector.Bijector):
           validate_args=validate_args,
           parameters=parameters,
           name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict()
 
   def _maybe_implement(self, fn, lhs_name, rhs_name):
     if not fn:

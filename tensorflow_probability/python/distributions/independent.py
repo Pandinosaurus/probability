@@ -20,14 +20,20 @@ from __future__ import print_function
 
 import collections
 
+import numpy as np
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python import math as tfp_math
 from tensorflow_probability.python.distributions import distribution as distribution_lib
 from tensorflow_probability.python.distributions import kullback_leibler
+from tensorflow_probability.python.distributions import log_prob_ratio
 from tensorflow_probability.python.internal import assert_util
-from tensorflow_probability.python.internal import prefer_static
+from tensorflow_probability.python.internal import parameter_properties
+from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.internal import tensorshape_util
+
+from tensorflow.python.util import deprecation  # pylint: disable=g-direct-tensorflow-import
 
 
 class Independent(distribution_lib.Distribution):
@@ -93,10 +99,17 @@ class Independent(distribution_lib.Distribution):
 
   """
 
+  @deprecation.deprecated_arg_values(
+      '2022-03-01',
+      'Please pass an integer value for `reinterpreted_batch_ndims`. The '
+      'current behavior corresponds to `reinterpreted_batch_ndims=tf.size('
+      'distribution.batch_shape_tensor()) - 1`.',
+      reinterpreted_batch_ndims=None)
   def __init__(self,
                distribution,
                reinterpreted_batch_ndims=None,
                validate_args=False,
+               experimental_use_kahan_sum=False,
                name=None):
     """Construct an `Independent` distribution.
 
@@ -110,6 +123,11 @@ class Independent(distribution_lib.Distribution):
       validate_args: Python `bool`.  Whether to validate input with asserts.
         If `validate_args` is `False`, and the inputs are invalid,
         correct behavior is not guaranteed.
+      experimental_use_kahan_sum: Python `bool`. When `True`, we use Kahan
+        summation to aggregate independent underlying log_prob values, which
+        improves against the precision of a naive float32 sum. This can be
+        noticeable in particular for large dimensions in float32. See CPU caveat
+        on `tfp.math.reduce_kahan_sum`.
       name: The name for ops managed by the distribution.
         Default value: `Independent + distribution.name`.
 
@@ -118,6 +136,7 @@ class Independent(distribution_lib.Distribution):
         `distribution.batch_ndims`
     """
     parameters = dict(locals())
+    self._experimental_use_kahan_sum = experimental_use_kahan_sum
     with tf.name_scope(name or ('Independent' + distribution.name)) as name:
       self._distribution = distribution
 
@@ -126,7 +145,7 @@ class Independent(distribution_lib.Distribution):
         batch_ndims = tensorshape_util.rank(distribution.batch_shape)
         if batch_ndims is not None:
           self._static_reinterpreted_batch_ndims = max(0, batch_ndims - 1)
-          self._reinterpreted_batch_ndims = tf.convert_to_tensor(
+          self._reinterpreted_batch_ndims = ps.convert_to_shape_tensor(
               self._static_reinterpreted_batch_ndims,
               dtype_hint=tf.int32,
               name='reinterpreted_batch_ndims')
@@ -138,6 +157,7 @@ class Independent(distribution_lib.Distribution):
         self._reinterpreted_batch_ndims = tensor_util.convert_nonref_to_tensor(
             reinterpreted_batch_ndims,
             dtype_hint=tf.int32,
+            as_shape_tensor=True,
             name='reinterpreted_batch_ndims')
         static_val = tf.get_static_value(self._reinterpreted_batch_ndims)
         self._static_reinterpreted_batch_ndims = (
@@ -159,6 +179,10 @@ class Independent(distribution_lib.Distribution):
   def reinterpreted_batch_ndims(self):
     return self._reinterpreted_batch_ndims
 
+  @property
+  def experimental_is_sharded(self):
+    return self.distribution.experimental_is_sharded
+
   def _get_reinterpreted_batch_ndims(self,
                                      distribution_batch_shape_tensor=None):
     if self._static_reinterpreted_batch_ndims is not None:
@@ -168,7 +192,9 @@ class Independent(distribution_lib.Distribution):
 
     if distribution_batch_shape_tensor is None:
       distribution_batch_shape_tensor = self.distribution.batch_shape_tensor()
-    return tf.maximum(0, tf.size(distribution_batch_shape_tensor) - 1)
+    return ps.cast(
+        ps.maximum(0, ps.size(distribution_batch_shape_tensor) - 1),
+        np.int32)
 
   def __getitem__(self, slices):
     # Because slicing is parameterization-dependent, we only implement slicing
@@ -189,9 +215,19 @@ class Independent(distribution_lib.Distribution):
         distribution=self.distribution[slices],
         reinterpreted_batch_ndims=self._static_reinterpreted_batch_ndims)
 
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    return dict(
+        distribution=parameter_properties.BatchedComponentProperties(
+            # TODO(davmre): replace with `self.reinterpreted_batch_ndims` once
+            # support for `reinterpreted_batch_ndims=None` has been removed.
+            event_ndims=lambda self: self._get_reinterpreted_batch_ndims()),  # pylint: disable=protected-access
+        reinterpreted_batch_ndims=(
+            parameter_properties.ShapeParameterProperties()))
+
   def _batch_shape_tensor(self):
     batch_shape = self.distribution.batch_shape_tensor()
-    batch_ndims = prefer_static.rank_from_shape(
+    batch_ndims = ps.rank_from_shape(
         batch_shape, self.distribution.batch_shape)
     return batch_shape[
         :batch_ndims - self._get_reinterpreted_batch_ndims(batch_shape)]
@@ -212,11 +248,11 @@ class Independent(distribution_lib.Distribution):
     batch_shape = self.distribution.batch_shape
     if not tensorshape_util.is_fully_defined(batch_shape):
       batch_shape = self.distribution.batch_shape_tensor()
-    batch_ndims = prefer_static.rank_from_shape(batch_shape)
+    batch_ndims = ps.rank_from_shape(batch_shape)
     event_shape = self.distribution.event_shape
     if not tensorshape_util.is_fully_defined(event_shape):
       event_shape = self.distribution.event_shape_tensor()
-    return prefer_static.concat([
+    return ps.concat([
         batch_shape[
             batch_ndims - self._get_reinterpreted_batch_ndims(batch_shape):],
         event_shape,
@@ -239,18 +275,32 @@ class Independent(distribution_lib.Distribution):
   def _sample_n(self, n, seed, **kwargs):
     return self.distribution.sample(sample_shape=n, seed=seed, **kwargs)
 
+  def _sum_fn(self):
+    if self._experimental_use_kahan_sum:
+      return lambda x, axis: tfp_math.reduce_kahan_sum(x, axis).total
+    return tf.math.reduce_sum
+
+  def _sample_and_log_prob(self, sample_shape, seed, **kwargs):
+    x, lp = self.distribution.experimental_sample_and_log_prob(
+        sample_shape, seed=seed, **kwargs)
+    return x, self._reduce(self._sum_fn(), lp)
+
   def _log_prob(self, x, **kwargs):
     return self._reduce(
-        tf.reduce_sum, self.distribution.log_prob(x, **kwargs))
+        self._sum_fn(), self.distribution.log_prob(x, **kwargs))
+
+  def _unnormalized_log_prob(self, x, **kwargs):
+    return self._reduce(
+        self._sum_fn(), self.distribution.unnormalized_log_prob(x, **kwargs))
 
   def _log_cdf(self, x, **kwargs):
-    return self._reduce(tf.reduce_sum, self.distribution.log_cdf(x, **kwargs))
+    return self._reduce(self._sum_fn(), self.distribution.log_cdf(x, **kwargs))
 
   def _entropy(self, **kwargs):
     # NOTE: If self._reinterpreted_batch_ndims is None, we could avoid a read
     # of self.distribution.batch_shape_tensor() in `self._reduce` here by
     # passing in `tf.shape(self.distribution.entropy())` to use instead.
-    return self._reduce(tf.reduce_sum, self.distribution.entropy(**kwargs))
+    return self._reduce(self._sum_fn(), self.distribution.entropy(**kwargs))
 
   def _mean(self, **kwargs):
     return self.distribution.mean(**kwargs)
@@ -265,7 +315,17 @@ class Independent(distribution_lib.Distribution):
     return self.distribution.mode(**kwargs)
 
   def _default_event_space_bijector(self):
-    return self.distribution.experimental_default_event_space_bijector()
+    bijector = self.distribution.experimental_default_event_space_bijector()
+    if (bijector is not None and
+        getattr(bijector,
+                '_use_kahan_sum',
+                False) != self._experimental_use_kahan_sum):
+      # Copy in case the wrapped distribution doesn't construct a brand-new
+      # bijector each time.
+      bijector = bijector.copy()
+      # TODO(b/191803645): Come up with an API to set this.
+      bijector._use_kahan_sum = self._experimental_use_kahan_sum  # pylint: disable=protected-access
+    return bijector
 
   def _parameter_control_dependencies(self, is_init):
     # self, distribution, reinterpreted_batch_ndims, validate_args):
@@ -284,18 +344,14 @@ class Independent(distribution_lib.Distribution):
       assertions.append(
           assert_util.assert_less_equal(
               self._get_reinterpreted_batch_ndims(batch_shape_tensor),
-              prefer_static.rank_from_shape(batch_shape_tensor),
+              ps.rank_from_shape(batch_shape_tensor),
               message=('reinterpreted_batch_ndims cannot exceed '
                        'distribution.batch_ndims')))
     return assertions
 
   def _reduce(self, op, stat):
-    axis = 1 + prefer_static.range(self._get_reinterpreted_batch_ndims())
+    axis = 1 + ps.range(self._get_reinterpreted_batch_ndims())
     return op(stat, axis=-axis)
-
-  _composite_tensor_nonshape_params = ('distribution',)
-
-  _composite_tensor_shape_params = ('reinterpreted_batch_ndims',)
 
 
 @kullback_leibler.RegisterKL(Independent, Independent)
@@ -359,10 +415,28 @@ def _kl_independent(a, b, name='kl_independent'):
                 message='Event shapes do not match.'),
         ]):
       num_reduce_dims = (
-          prefer_static.rank_from_shape(
+          ps.rank_from_shape(
               a_event_shape_tensor, a.event_shape) -
-          prefer_static.rank_from_shape(
+          ps.rank_from_shape(
               p_event_shape_tensor, p.event_shape))
-      reduce_dims = prefer_static.range(-num_reduce_dims, 0, 1)
+      reduce_dims = ps.range(-num_reduce_dims, 0, 1)
       return tf.reduce_sum(
           kullback_leibler.kl_divergence(p, q, name=name), axis=reduce_dims)
+
+
+@log_prob_ratio.RegisterLogProbRatio(Independent)
+def _independent_log_prob_ratio(p, x, q, y, name=None):
+  """Sum-of-diffs log(p(x)/q(y)) for `Independent`s."""
+  with tf.name_scope(name or 'independent_log_prob_ratio'):
+    checks = []
+    if p.validate_args or q.validate_args:
+      checks.append(tf.debugging.assert_equal(
+          p.reinterpreted_batch_ndims, q.reinterpreted_batch_ndims))
+    if p._experimental_use_kahan_sum or q._experimental_use_kahan_sum:  # pylint: disable=protected-access
+      sum_fn = lambda x, axis: tfp_math.reduce_kahan_sum(x, axis).total
+    else:
+      sum_fn = tf.reduce_sum
+    with tf.control_dependencies(checks):
+      return sum_fn(
+          log_prob_ratio.log_prob_ratio(p.distribution, x, q.distribution, y),
+          axis=-1 - ps.range(p.reinterpreted_batch_ndims))

@@ -325,7 +325,7 @@ def min_rank_for_support(support):
   raise NotImplementedError(support)
 
 
-def constrained_tensors(constraint_fn, shape, dtype=np.float32):
+def constrained_tensors(constraint_fn, shape, dtype=np.float32, elements=None):
   """Strategy for drawing a constrained Tensor.
 
   Args:
@@ -333,6 +333,7 @@ def constrained_tensors(constraint_fn, shape, dtype=np.float32):
       constrained space.
     shape: Shape of the desired Tensors as a Python list.
     dtype: Dtype for constrained Tensors.
+    elements: Optional strategy for selecting array elements.
 
   Returns:
     tensors: A strategy for drawing constrained Tensors of the given shape.
@@ -341,7 +342,13 @@ def constrained_tensors(constraint_fn, shape, dtype=np.float32):
   # float32s = hps.floats(
   #     np.finfo(np.float32).min / 2, np.finfo(np.float32).max / 2,
   #     allow_nan=False, allow_infinity=False)
-  floats = hps.floats(-200, 200, allow_nan=False, allow_infinity=False)
+  if elements is None:
+    if dtype_util.is_floating(dtype):
+      elements = hps.floats(-200, 200, allow_nan=False, allow_infinity=False)
+    elif dtype_util.is_bool(dtype):
+      elements = hps.booleans()
+    else:
+      raise NotImplementedError(dtype)
 
   def mapper(x):
     x = constraint_fn(tf.convert_to_tensor(x, dtype_hint=dtype))
@@ -352,7 +359,7 @@ def constrained_tensors(constraint_fn, shape, dtype=np.float32):
             constraint_fn, np.array(x)))
     return x
 
-  return hpnp.arrays(dtype=dtype, shape=shape, elements=floats).map(mapper)
+  return hpnp.arrays(dtype=dtype, shape=shape, elements=elements).map(mapper)
 
 
 # pylint: disable=no-value-for-parameter
@@ -435,6 +442,7 @@ def broadcasting_params(draw,
                         enable_vars=False,
                         constraint_fn_for=lambda param: identity_fn,
                         mutex_params=(),
+                        param_strategy_fn=None,
                         dtype=np.float32):
   """Streategy for drawing parameters which jointly have the given batch shape.
 
@@ -467,6 +475,10 @@ def broadcasting_params(draw,
       mutually exclusive parameters (e.g., the 'probs' and 'logits' of a
       Categorical).  At most one parameter from each set will appear in the
       result.
+    param_strategy_fn: Optional callable with signature
+      `strategy = param_strategy_fn(shape, dtype, constraint_fn)`. If provided,
+      overrides the default strategy for generating float-valued parameters.
+      Default value: `constrained_tensors`.
     dtype: Dtype for generated parameters.
 
   Returns:
@@ -479,6 +491,8 @@ def broadcasting_params(draw,
   """
   if event_dim is None:
     event_dim = draw(hps.integers(min_value=2, max_value=6))
+  if param_strategy_fn is None:
+    param_strategy_fn = constrained_tensors
 
   params_event_ndims = params_event_ndims or {}
   remaining_params = set(params_event_ndims.keys())
@@ -504,12 +518,14 @@ def broadcasting_params(draw,
     hp.assume(len(param_shape) < 6)
 
     # TODO(axch): Can I replace `params_event_ndims` and `constraint_fn_for`
-    # with a map from params to `Suppport`s, and use `tensors_in_support` here
-    # instead of this explicit `constrained_tensors` function?
-    param_strategy = constrained_tensors(
-        constraint_fn_for(param), param_shape, dtype=dtype)
-    params_kwargs[param] = draw(maybe_variable(
-        param_strategy, enable_vars=enable_vars, dtype=dtype, name=param))
+    # with a map from params to `Suppport`s, and use `tensors_in_support` here?
+    param_strategy = param_strategy_fn(constraint_fn=constraint_fn_for(param),
+                                       shape=param_shape,
+                                       dtype=dtype)
+    params_kwargs[param] = draw(maybe_variable(param_strategy,
+                                               enable_vars=enable_vars,
+                                               dtype=dtype,
+                                               name=param))
   return params_kwargs
 
 
@@ -545,7 +561,7 @@ def maybe_variable(draw,
     else:
       alt_name = '{}_alt_value'.format(name)
     alt_value = tf.convert_to_tensor(
-        draw(strategy), dtype_hint=dtype, name=alt_name)
+        draw(strategy), dtype=result.dtype, name=alt_name)
     # This field provides an acceptable alternate value, to enable tests that
     # mutate the Variable (once).
     setattr(result, '_tfp_alt_value', alt_value)
@@ -577,7 +593,7 @@ def broadcasting_named_shapes(draw, batch_shape, param_names):
   n = len(param_names)
   return dict(
       zip(draw(hps.permutations(param_names)),
-          draw(broadcasting_shapes(batch_shape, n))))
+          draw(broadcasting_shapes(batch_shape, n, no_error_n_eq_1=True))))
 
 
 def _compute_rank_and_fullsize_reqd(draw, target_shape, current_shape, is_last):
@@ -635,7 +651,7 @@ def broadcast_compatible_shape(shape):
 
 
 @hps.composite
-def broadcasting_shapes(draw, target_shape, n):
+def broadcasting_shapes(draw, target_shape, n, no_error_n_eq_1=False):
   """Strategy for drawing a set of `n` shapes that broadcast to `target_shape`.
 
   For each shape we need to choose its rank, and whether or not each axis i is 1
@@ -647,12 +663,17 @@ def broadcasting_shapes(draw, target_shape, n):
     draw: Hypothesis strategy sampler supplied by `@hps.composite`.
     target_shape: The target (fully-defined) batch shape.
     n: Python `int`, the number of shapes to draw.
+    no_error_n_eq_1: If True, don't raise ValueError when n==1.
 
   Returns:
     shapes: A strategy for drawing sequences of `tf.TensorShape` such that the
       set of shapes in each sequence broadcast to `target_shape`. The shapes are
       fully defined.
   """
+  if n == 1 and not no_error_n_eq_1:
+    raise ValueError('`broadcasting_shapes(shp, n=1) is just `shp`. '
+                     'Did you want `broadcast_compatible_shape`? If `n` '
+                     'is stochastic, add arg `no_error_n_eq_1=True`.')
   target_shape = tf.TensorShape(target_shape)
   target_rank = tensorshape_util.rank(target_shape)
   result = []
@@ -742,6 +763,22 @@ def no_tf_rank_errors():
       raise
 
 
+@contextlib.contextmanager
+def finite_ground_truth_only():
+  # Recognizing the error message from python/internal/numerics_testing.py
+  pat = 'Cannot check accuracy if ground truth or derivatives are not finite'
+  try:
+    yield
+  except tf.errors.InvalidArgumentError as e:
+    msg = str(e)
+    if re.search(pat, msg):
+      # Tried an input regime where the 64-bit computation produced a
+      # non-finite value or gradient
+      hp.assume(False)
+    else:
+      raise
+
+
 # Utility functions for constraining parameters and/or domain/codomain members.
 
 
@@ -767,7 +804,7 @@ def orthonormal(x):
 
 def lower_tril_positive_definite(x):
   return tf.linalg.band_part(
-      tf.linalg.set_diag(x, softplus_plus_eps()(tf.linalg.diag_part(x))),
+      tf.linalg.set_diag(x, softplus_plus_eps(1e-4)(tf.linalg.diag_part(x))),
       num_lower=-1,
       num_upper=0)
 

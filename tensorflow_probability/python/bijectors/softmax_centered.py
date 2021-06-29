@@ -34,7 +34,7 @@ __all__ = [
 ]
 
 
-class SoftmaxCentered(bijector.Bijector):
+class SoftmaxCentered(bijector.AutoCompositeTensorBijector):
   """Bijector which computes `Y = g(X) = exp([X 0]) / sum(exp([X 0]))`.
 
   To implement [softmax](https://en.wikipedia.org/wiki/Softmax_function) as a
@@ -72,6 +72,10 @@ class SoftmaxCentered(bijector.Bijector):
           validate_args=validate_args,
           parameters=parameters,
           name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict()
 
   def _forward_event_shape(self, input_shape):
     return self._pad.forward_event_shape(input_shape)

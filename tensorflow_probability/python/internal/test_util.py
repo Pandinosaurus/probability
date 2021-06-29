@@ -162,7 +162,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
       # Drop the final two newlines.
       raise AssertionError(final_msg[:-2])
 
-  def assertAllEqualNested(self, a, b, check_types=False):
+  def assertAllEqualNested(self, a, b, check_types=False, shallow=None):
     """Assert that analogous entries in two nested structures are equivalent.
 
     Args:
@@ -171,13 +171,18 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
       check_types: If `True`, types of sequences are checked as well, including
         the keys of dictionaries. If `False`, for example a list and a tuple of
         objects may be equivalent.
+      shallow: If not None, uses this as the shared tree prefix of `a` and `b`
+        for the purpose of being able to use `a` and `b` which only share that
+        tree prefix (e.g. `[1, 2]` and `[[1], 2]` share the `[., .]` tree
+        prefix).
     """
     self.assertAllAssertsNested(
         self.assertAllEqual,
         a,
         b,
         check_types=check_types,
-        msg='AllEqualNested failed')
+        msg='AllEqualNested failed',
+        shallow=shallow)
 
   def assertAllCloseNested(
       self, a, b, rtol=1e-06, atol=1e-06, check_types=False):
@@ -204,13 +209,13 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
   def assertAllTrue(self, a):
     """Assert that all entries in a boolean `Tensor` are True."""
     a_ = self._GetNdArray(a)
-    all_true = np.ones_like(a_, dtype=np.bool)
+    all_true = np.ones_like(a_, dtype=np.bool_)
     self.assertAllEqual(all_true, a_)
 
   def assertAllFalse(self, a):
     """Assert that all entries in a boolean `Tensor` are False."""
     a_ = self._GetNdArray(a)
-    all_false = np.zeros_like(a_, dtype=np.bool)
+    all_false = np.zeros_like(a_, dtype=np.bool_)
     self.assertAllEqual(all_false, a_)
 
   def assertAllFinite(self, a):
@@ -220,7 +225,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
       a: A `Tensor` whose entries are checked for finiteness.
     """
     is_finite = np.isfinite(self._GetNdArray(a))
-    all_true = np.ones_like(is_finite, dtype=np.bool)
+    all_true = np.ones_like(is_finite, dtype=np.bool_)
     self.assertAllEqual(all_true, is_finite)
 
   def assertAllPositiveInf(self, a):
@@ -230,7 +235,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
       a: A `Tensor` whose entries must be verified as positive infinity.
     """
     is_positive_inf = np.isposinf(self._GetNdArray(a))
-    all_true = np.ones_like(is_positive_inf, dtype=np.bool)
+    all_true = np.ones_like(is_positive_inf, dtype=np.bool_)
     self.assertAllEqual(all_true, is_positive_inf)
 
   def assertAllNegativeInf(self, a):
@@ -240,7 +245,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
       a: A `Tensor` whose entries must be verified as negative infinity.
     """
     is_negative_inf = np.isneginf(self._GetNdArray(a))
-    all_true = np.ones_like(is_negative_inf, dtype=np.bool)
+    all_true = np.ones_like(is_negative_inf, dtype=np.bool_)
     self.assertAllEqual(all_true, is_negative_inf)
 
   def assertNotAllZero(self, a):
@@ -258,7 +263,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
       a: A `Tensor` whose entries must be verified as not NaN.
     """
     is_not_nan = ~np.isnan(self._GetNdArray(a))
-    all_true = np.ones_like(is_not_nan, dtype=np.bool)
+    all_true = np.ones_like(is_not_nan, dtype=np.bool_)
     self.assertAllEqual(all_true, is_not_nan)
 
   def assertAllNan(self, a):
@@ -268,7 +273,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
       a: A `Tensor` whose entries must be verified as NaN.
     """
     is_nan = np.isnan(self._GetNdArray(a))
-    all_true = np.ones_like(is_nan, dtype=np.bool)
+    all_true = np.ones_like(is_nan, dtype=np.bool_)
     self.assertAllEqual(all_true, is_nan)
 
   def assertAllNotNone(self, a):
@@ -368,7 +373,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
 
   def skip_if_no_xla(self):
     try:
-      tf.function(lambda: tf.constant(0), experimental_compile=True)()
+      tf.function(lambda: tf.constant(0), jit_compile=True)()
     except (tf.errors.UnimplementedError, NotImplementedError) as e:
       if 'Could not find compiler' in str(e):
         self.skipTest('XLA not available')

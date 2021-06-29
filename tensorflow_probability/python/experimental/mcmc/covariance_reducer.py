@@ -26,7 +26,6 @@ import tensorflow.compat.v2 as tf
 from tensorflow_probability.python.experimental.mcmc import reducer as reducer_base
 from tensorflow_probability.python.experimental.stats import sample_stats
 from tensorflow_probability.python.internal import nest_util
-from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.mcmc.internal import util as mcmc_util
 from tensorflow.python.util import nest  # pylint: disable=g-direct-tensorflow-import
 
@@ -175,17 +174,16 @@ class CovarianceReducer(reducer_base.Reducer):
       if initial_kernel_results is not None:
         initial_kernel_results = tf.nest.map_structure(
             tf.convert_to_tensor,
-            initial_kernel_results)
+            initial_kernel_results,
+            expand_composites=True)
       initial_fn_result = tf.nest.map_structure(
           lambda fn: fn(initial_chain_state, initial_kernel_results),
           self.transform_fn)
       event_ndims = _canonicalize_event_ndims(
           initial_fn_result, self.event_ndims)
-      def init(tensor, event_ndims):
-        return sample_stats.RunningCovariance.from_shape(
-            ps.shape(tensor), tensor.dtype, event_ndims)
       running_covariances = tf.nest.map_structure(
-          init, initial_fn_result, event_ndims)
+          sample_stats.RunningCovariance.from_example,
+          initial_fn_result, event_ndims)
       return CovarianceReducerState(running_covariances)
 
   def one_step(
@@ -231,13 +229,14 @@ class CovarianceReducer(reducer_base.Reducer):
       if previous_kernel_results is not None:
         previous_kernel_results = tf.nest.map_structure(
             tf.convert_to_tensor,
-            previous_kernel_results)
+            previous_kernel_results,
+            expand_composites=True)
       fn_results = tf.nest.map_structure(
           lambda fn: fn(new_chain_state, previous_kernel_results),
           self.transform_fn)
       if not nest.is_nested(axis):
         axis = nest_util.broadcast_structure(fn_results, axis)
-      running_covariances = nest.map_structure(
+      running_covariances = tf.nest.map_structure(
           lambda cov, *args: cov.update(*args),
           current_reducer_state.cov_state,
           fn_results,

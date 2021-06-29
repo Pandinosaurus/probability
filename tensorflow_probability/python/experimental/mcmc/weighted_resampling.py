@@ -47,7 +47,7 @@ def resample(particles, log_weights, resample_fn, seed=None):
       Use 'resample_independent' for independent resamples.
       Use 'resample_stratified' for stratified resampling.
       Use 'resample_systematic' for systematic resampling.
-    seed: Python `int` random seed.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
   Returns:
     resampled_particles: Nested structure of `Tensor`s, matching `particles`.
@@ -181,7 +181,7 @@ def resample_independent(log_probs, event_size, sample_shape,
     log_probs: A tensor-valued batch of discrete log probability distributions.
     event_size: the dimension of the vector considered a single draw.
     sample_shape: the `sample_shape` determining the number of draws.
-    seed: Python '`int` used to seed calls to `tf.random.*`.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
       Default value: None (i.e. no seed).
     name: Python `str` name for ops created by this method.
       Default value: `None` (i.e., `'resample_independent'`).
@@ -243,7 +243,7 @@ def resample_systematic(log_probs, event_size, sample_shape,
     log_probs: A tensor-valued batch of discrete log probability distributions.
     event_size: the dimension of the vector considered a single draw.
     sample_shape: the `sample_shape` determining the number of draws.
-    seed: Python '`int` used to seed calls to `tf.random.*`.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
       Default value: None (i.e. no seed).
     name: Python `str` name for ops created by this method.
       Default value: `None` (i.e., `'resample_systematic'`).
@@ -311,7 +311,7 @@ def resample_stratified(log_probs, event_size, sample_shape,
     log_probs: A tensor-valued batch of discrete log probability distributions.
     event_size: the dimension of the vector considered a single draw.
     sample_shape: the `sample_shape` determining the number of draws.
-    seed: Python '`int` used to seed calls to `tf.random.*`.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
       Default value: None (i.e. no seed).
     name: Python `str` name for ops created by this method.
       Default value: `None` (i.e., `'resample_independent'`).

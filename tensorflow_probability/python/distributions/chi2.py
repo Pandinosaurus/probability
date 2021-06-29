@@ -21,6 +21,7 @@ from __future__ import print_function
 import numpy as np
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python import math as tfp_math
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import gamma as gamma_lib
@@ -29,7 +30,6 @@ from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import parameter_properties
-from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import reparameterization
 from tensorflow_probability.python.internal import tensor_util
 
@@ -39,7 +39,7 @@ __all__ = [
 ]
 
 
-class Chi2(distribution.Distribution):
+class Chi2(distribution.AutoCompositeTensorDistribution):
   """Chi2 distribution.
 
   The Chi2 distribution is defined over positive real numbers using a degrees of
@@ -112,12 +112,6 @@ class Chi2(distribution.Distribution):
   def df(self):
     return self._df
 
-  def _batch_shape_tensor(self):
-    return ps.shape(self.df)
-
-  def _batch_shape(self):
-    return self.df.shape
-
   def _event_shape_tensor(self):
     return tf.constant([], dtype=tf.int32)
 
@@ -144,6 +138,9 @@ class Chi2(distribution.Distribution):
 
   def _cdf(self, x):
     return tf.math.igamma(0.5 * self.df, 0.5 * x)
+
+  def _quantile(self, p):
+    return 2. * tfp_math.igammainv(0.5 * self.df, p)
 
   def _entropy(self):
     concentration = 0.5 * self.df

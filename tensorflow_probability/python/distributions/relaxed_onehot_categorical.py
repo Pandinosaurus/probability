@@ -38,7 +38,7 @@ from tensorflow_probability.python.internal import tensorshape_util
 from tensorflow.python.util import deprecation  # pylint: disable=g-direct-tensorflow-import
 
 
-class ExpRelaxedOneHotCategorical(distribution.Distribution):
+class ExpRelaxedOneHotCategorical(distribution.AutoCompositeTensorDistribution):
   """ExpRelaxedOneHotCategorical distribution with temperature and logits.
 
   An ExpRelaxedOneHotCategorical distribution is a log-transformed
@@ -234,19 +234,6 @@ class ExpRelaxedOneHotCategorical(distribution.Distribution):
     """Input argument `probs`."""
     return self._probs
 
-  def _batch_shape_tensor(self, temperature=None, logits=None):
-    param = logits
-    if param is None:
-      param = self._logits if self._logits is not None else self._probs
-    if temperature is None:
-      temperature = self.temperature
-    return ps.broadcast_shape(
-        ps.shape(temperature), ps.shape(param)[:-1])
-
-  def _batch_shape(self):
-    param = self._logits if self._logits is not None else self._probs
-    return tf.broadcast_static_shape(self.temperature.shape, param.shape[:-1])
-
   def _event_shape_tensor(self, logits=None):
     param = logits
     if param is None:
@@ -310,7 +297,7 @@ class ExpRelaxedOneHotCategorical(distribution.Distribution):
   def _logits_parameter_no_checks(self):
     if self._logits is None:
       return tf.math.log(self._probs)
-    return tf.identity(self._logits)
+    return tensor_util.identity_as_tensor(self._logits)
 
   def probs_parameter(self, name=None):
     """Probs vec computed from non-`None` input arg (`probs` or `logits`)."""
@@ -319,7 +306,7 @@ class ExpRelaxedOneHotCategorical(distribution.Distribution):
 
   def _probs_parameter_no_checks(self):
     if self._logits is None:
-      return tf.identity(self._probs)
+      return tensor_util.identity_as_tensor(self._probs)
     return tf.math.softmax(self._logits)
 
   def _sample_control_dependencies(self, x):
@@ -410,7 +397,8 @@ class ExpRelaxedOneHotCategorical(distribution.Distribution):
 
 
 class RelaxedOneHotCategorical(
-    transformed_distribution.TransformedDistribution):
+    transformed_distribution.TransformedDistribution,
+    distribution.AutoCompositeTensorDistribution):
   """RelaxedOneHotCategorical distribution with temperature and logits.
 
   The RelaxedOneHotCategorical is a distribution over random probability
@@ -512,7 +500,7 @@ class RelaxedOneHotCategorical(
         undefined statistics will return NaN for this statistic.
       name: A name for this distribution (optional).
     """
-
+    parameters = dict(locals())
     dist = ExpRelaxedOneHotCategorical(temperature,
                                        logits=logits,
                                        probs=probs,
@@ -522,7 +510,24 @@ class RelaxedOneHotCategorical(
     super(RelaxedOneHotCategorical, self).__init__(dist,
                                                    exp_bijector.Exp(),
                                                    validate_args=validate_args,
+                                                   parameters=parameters,
                                                    name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    # pylint: disable=g-long-lambda
+    return dict(
+        temperature=parameter_properties.ParameterProperties(
+            shape_fn=lambda sample_shape: sample_shape[:-1],
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
+        logits=parameter_properties.ParameterProperties(event_ndims=1),
+        probs=parameter_properties.ParameterProperties(
+            event_ndims=1,
+            default_constraining_bijector_fn=softmax_centered_bijector
+            .SoftmaxCentered,
+            is_preferred=False))
+    # pylint: enable=g-long-lambda
 
   @property
   def temperature(self):
@@ -547,6 +552,8 @@ class RelaxedOneHotCategorical(
   def logits(self):
     """Input argument `logits`."""
     return self.distribution.logits
+
+  experimental_is_sharded = False
 
   def logits_parameter(self, name=None):
     """Logits vec computed from non-`None` input arg (`probs` or `logits`)."""

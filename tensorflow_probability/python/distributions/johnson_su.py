@@ -14,10 +14,6 @@
 # ============================================================================
 """Johnson's SU distribution class."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 # Dependency imports
 import tensorflow.compat.v2 as tf
 from tensorflow_probability.python.bijectors import invert as invert_bijector
@@ -25,13 +21,12 @@ from tensorflow_probability.python.bijectors import scale as scale_bijector
 from tensorflow_probability.python.bijectors import shift as shift_bijector
 from tensorflow_probability.python.bijectors import sinh as sinh_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import normal
 from tensorflow_probability.python.distributions import transformed_distribution
 from tensorflow_probability.python.internal import assert_util
-from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import parameter_properties
-from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import tensor_util
 
 
@@ -40,7 +35,10 @@ __all__ = [
 ]
 
 
-class JohnsonSU(transformed_distribution.TransformedDistribution):
+# TODO(b/182603117): Remove `AutoCompositeTensor` subclass when
+# `TransformedDistribution` is converted to `CompositeTensor`.
+class JohnsonSU(transformed_distribution.TransformedDistribution,
+                distribution.AutoCompositeTensorDistribution):
   """Johnson's SU-distribution.
 
   This distribution has parameters: shape parameters `skewness` and
@@ -203,17 +201,9 @@ class JohnsonSU(transformed_distribution.TransformedDistribution):
                                    validate_args=validate_args)
 
       bijector = shift(scale(sinh(norm_scale(norm_shift))))
-
-      batch_rank = ps.reduce_max([
-          distribution_util.prefer_static_rank(x)
-          for x in (self._skewness, self._tailweight, self._loc, self._scale)])
-
       super(JohnsonSU, self).__init__(
-          # TODO(b/160730249): Make `loc` a scalar `0.` and remove overridden
-          # `batch_shape` and `batch_shape_tensor` when
-          # TransformedDistribution's bijector can modify its `batch_shape`.
           distribution=normal.Normal(
-              loc=tf.zeros(ps.ones(batch_rank, tf.int32), dtype=dtype),
+              loc=tf.zeros([], dtype=dtype),
               scale=tf.ones([], dtype=dtype),
               validate_args=validate_args,
               allow_nan_stats=allow_nan_stats),
@@ -256,6 +246,8 @@ class JohnsonSU(transformed_distribution.TransformedDistribution):
     """Scaling factors of these Johnson's SU distribution(s)."""
     return self._scale
 
+  experimental_is_sharded = False
+
   def _mean(self):
     skewness, tailweight, scale, loc = (
         [tf.convert_to_tensor(v)
@@ -275,17 +267,6 @@ class JohnsonSU(transformed_distribution.TransformedDistribution):
                  tf.math.cosh(2. * skewness / tailweight) + 1.))
 
     return tf.broadcast_to(variance, self.batch_shape_tensor())
-
-  def _batch_shape(self):
-    params = [self.skewness, self.tailweight, self.loc, self.scale]
-    s_shape = params[0].shape
-    for t in params[1:]:
-      s_shape = tf.broadcast_static_shape(s_shape, t.shape)
-    return s_shape
-
-  def _batch_shape_tensor(self):
-    return distribution_util.get_broadcast_shape(
-        self.skewness, self.tailweight, self.loc, self.scale)
 
   def _parameter_control_dependencies(self, is_init):
     assertions = []

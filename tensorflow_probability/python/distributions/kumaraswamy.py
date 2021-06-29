@@ -24,9 +24,10 @@ import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python import math as tfp_math
 from tensorflow_probability.python.bijectors import invert
-from tensorflow_probability.python.bijectors import kumaraswamy_cdf as kumaraswamy_cdf
+from tensorflow_probability.python.bijectors import kumaraswamy_cdf
 from tensorflow_probability.python.bijectors import sigmoid as sigmoid_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import transformed_distribution
 from tensorflow_probability.python.distributions import uniform
 from tensorflow_probability.python.internal import assert_util
@@ -61,7 +62,10 @@ def _harmonic_number(x):
   return tf.math.digamma(x + one) - tf.math.digamma(one)
 
 
-class Kumaraswamy(transformed_distribution.TransformedDistribution):
+# TODO(b/182603117): Remove `AutoCompositeTensor` subclass when
+# `TransformedDistribution` is converted to `CompositeTensor`.
+class Kumaraswamy(transformed_distribution.TransformedDistribution,
+                  distribution.AutoCompositeTensorDistribution):
   """Kumaraswamy distribution.
 
   The Kumaraswamy distribution is defined over the `(0, 1)` interval using
@@ -164,13 +168,9 @@ class Kumaraswamy(transformed_distribution.TransformedDistribution):
           concentration1=concentration1,
           concentration0=concentration0,
           validate_args=validate_args)
-      batch_shape = distribution_util.get_broadcast_shape(
-          concentration1, concentration0)
       super(Kumaraswamy, self).__init__(
-          # TODO(b/137665504): Use batch-adding meta-distribution to set the
-          # batch shape instead of tf.zeros.
           distribution=uniform.Uniform(
-              low=tf.zeros(batch_shape, dtype=dtype),
+              low=tf.zeros([], dtype=dtype),
               high=tf.ones([], dtype=dtype),
               allow_nan_stats=allow_nan_stats),
           bijector=invert.Invert(
@@ -199,6 +199,8 @@ class Kumaraswamy(transformed_distribution.TransformedDistribution):
   def concentration0(self):
     """Concentration parameter associated with a `0` outcome."""
     return self._kumaraswamy_cdf.concentration0
+
+  experimental_is_sharded = False
 
   def _entropy(self):
     a = tf.convert_to_tensor(self.concentration1)

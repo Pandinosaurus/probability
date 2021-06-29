@@ -25,6 +25,7 @@ import numpy as np
 import tensorflow.compat.v1 as tf1
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python.internal import broadcast_util as bu
 from tensorflow_probability.python.internal import distribution_util as dist_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import prefer_static as ps
@@ -37,10 +38,6 @@ from tensorflow.python.util import deprecation  # pylint: disable=g-direct-tenso
 __all__ = [
     'choose',
     'enable_store_parameters_in_results',
-    'left_justified_expand_dims_like',
-    'left_justified_expand_dims_to',
-    'left_justified_broadcast_like',
-    'left_justified_broadcast_to',
     'index_remapping_gather',
     'is_list_like',
     'is_namedtuple_like',
@@ -76,36 +73,6 @@ class PrettyNamedTupleMixin(object):
         type(self).__name__,
         ',\n'.join('  {}={}'.format(k, repr(v).replace('\n', '\n    '))
                    for (k, v) in self._asdict().items()))
-
-
-def left_justified_expand_dims_like(x, reference, name=None):
-  """Right pads `x` with `rank(reference) - rank(x)` ones."""
-  with tf.name_scope(name or 'left_justified_expand_dims_like'):
-    return left_justified_expand_dims_to(x, ps.rank(reference))
-
-
-def left_justified_expand_dims_to(x, rank, name=None):
-  """Right pads `x` with `rank - rank(x)` ones."""
-  with tf.name_scope(name or 'left_justified_expand_dims_to'):
-    expand_ndims = ps.maximum(rank - ps.rank(x), 0)
-    expand_shape = ps.concat(
-        [ps.shape(x),
-         ps.ones(shape=[expand_ndims], dtype=tf.int32)],
-        axis=0)
-    return tf.reshape(x, expand_shape)
-
-
-def left_justified_broadcast_like(x, reference, name=None):
-  """Broadcasts `x` to shape of reference, in a left-justified manner."""
-  with tf.name_scope(name or 'left_justified_broadcast_like'):
-    return left_justified_broadcast_to(x, ps.shape(reference))
-
-
-def left_justified_broadcast_to(x, shape, name=None):
-  """Broadcasts `x` to shape, in a left-justified manner."""
-  with tf.name_scope(name or 'left_justified_broadcast_to'):
-    return tf.broadcast_to(
-        left_justified_expand_dims_to(x, ps.size(shape)), shape)
 
 
 def prepare_state_parts(state_or_state_part, dtype=None, name=None):
@@ -144,7 +111,8 @@ def make_name(super_name, default_super_name, sub_name):
 def _choose_base_case(is_accepted,
                       proposed,
                       current,
-                      name=None):
+                      name=None,
+                      addr=None,):
   """Helper to `choose` which expand_dims `is_accepted` and applies tf.where."""
   def _where(proposed, current):
     """Wraps `tf.where`."""
@@ -157,33 +125,41 @@ def _choose_base_case(is_accepted,
       name = name.rpartition('/')[2].rsplit(':', 1)[0]
     # Since this is an internal utility it is ok to assume
     # tf.shape(proposed) == tf.shape(current).
-    return tf.where(left_justified_expand_dims_like(is_accepted, proposed),
+    return tf.where(bu.left_justified_expand_dims_like(is_accepted, proposed),
                     proposed, current, name=name)
   with tf.name_scope(name or 'choose'):
     if not is_list_like(proposed):
       return _where(proposed, current)
-    return [(choose(is_accepted, p, c, name=name) if is_namedtuple_like(p)
-             else _where(p, c))
-            for p, c in zip(proposed, current)]
+    return tf.nest.pack_sequence_as(
+        current,
+        [(_choose_recursive(is_accepted, p, c, name=name, addr=f'{addr}[i]')
+          if is_namedtuple_like(p) else
+          _where(p, c)) for i, (p, c) in enumerate(zip(proposed, current))])
+
+
+def _choose_recursive(is_accepted, proposed, current, name=None, addr='<root>'):
+  """Recursion helper which also reports the address of any failures."""
+  with tf.name_scope(name or 'choose'):
+    if not is_namedtuple_like(proposed):
+      return _choose_base_case(is_accepted, proposed, current, name=name,
+                               addr=addr)
+    if not isinstance(proposed, type(current)):
+      raise TypeError(
+          f'Type of `proposed` ({type(proposed).__name__}) must be identical '
+          f'to type of `current` ({type(current).__name__}). (At "{addr}".)')
+    items = {}
+    for fn in proposed._fields:
+      items[fn] = _choose_recursive(is_accepted,
+                                    getattr(proposed, fn),
+                                    getattr(current, fn),
+                                    name=name,
+                                    addr=f'{addr}/{fn}')
+    return type(proposed)(**items)
 
 
 def choose(is_accepted, proposed, current, name=None):
   """Helper which expand_dims `is_accepted` then applies tf.where."""
-  with tf.name_scope(name or 'choose'):
-    if not is_namedtuple_like(proposed):
-      return _choose_base_case(is_accepted, proposed, current, name=name)
-    if not isinstance(proposed, type(current)):
-      raise TypeError('Type of `proposed` ({}) must be identical to '
-                      'type of `current` ({})'.format(
-                          type(proposed).__name__,
-                          type(current).__name__))
-    items = {}
-    for fn in proposed._fields:
-      items[fn] = choose(is_accepted,
-                         getattr(proposed, fn),
-                         getattr(current, fn),
-                         name=name)
-    return type(proposed)(**items)
+  return _choose_recursive(is_accepted, proposed, current, name=name)
 
 
 def strip_seeds(obj):
@@ -363,6 +339,7 @@ def trace_scan(loop_fn,
                trace_fn,
                trace_criterion_fn=None,
                static_trace_allocation_size=None,
+               condition_fn=None,
                parallel_iterations=10,
                name=None):
   """A simplified version of `tf.scan` that has configurable tracing.
@@ -396,6 +373,10 @@ def trace_scan(loop_fn,
       It is primarily intended for contexts where static shapes are required,
       such as in XLA-compiled code.
       Default value: `None`.
+    condition_fn: Python `callable` additional loop termination condition, with
+     signature `should_continue = condition_fn(step, state, num_traced, trace)`;
+     returning `False` will terminate early and not scan over all of `elems`.
+     Default value: `None`, which means no additional termination condition.
     parallel_iterations: Passed to the internal `tf.while_loop`.
     name: Name scope used in this function. Default: 'trace_scan'.
 
@@ -425,7 +406,7 @@ def trace_scan(loop_fn,
     elems_array = elems_array.unstack(elems)
 
     # Initialize trace arrays.
-    if trace_criterion_fn is None:
+    if trace_criterion_fn is None and condition_fn is None:
       dynamic_size, initial_size = tf.is_tensor(length), length
     elif static_trace_allocation_size is not None:
       dynamic_size, initial_size = False, static_trace_allocation_size
@@ -464,8 +445,13 @@ def trace_scan(loop_fn,
 
       return i + 1, state, num_steps_traced, trace_arrays
 
+    if condition_fn is None:
+      cond = lambda i, *_: i < length
+    else:
+      cond = lambda i, *rest: (i < length) & condition_fn(i, *rest)
+
     _, final_state, _, trace_arrays = tf.while_loop(
-        cond=lambda i, *_: i < length,
+        cond=cond,
         body=_body,
         loop_vars=(0, initial_state, 0, trace_arrays),
         parallel_iterations=parallel_iterations)
@@ -532,7 +518,7 @@ def _is_tensor_like(param):
   elif isinstance(param, tf.Variable):
     return False
   else:
-    return np.array(param).dtype != np.object
+    return np.array(param).dtype != np.object_
 
 
 def warn_if_parameters_are_not_simple_tensors(params_dict):

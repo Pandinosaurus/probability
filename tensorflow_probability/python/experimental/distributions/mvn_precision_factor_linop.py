@@ -23,8 +23,10 @@ from tensorflow_probability.python.distributions import mvn_diag
 from tensorflow_probability.python.distributions import transformed_distribution
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import tensor_util
+from tensorflow_probability.python.internal import tensorshape_util
 
 
 __all__ = ['MultivariateNormalPrecisionFactorLinearOperator']
@@ -217,6 +219,13 @@ class MultivariateNormalPrecisionFactorLinearOperator(
           name=name)
       self._parameters = parameters
 
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    return dict(
+        loc=parameter_properties.ParameterProperties(event_ndims=1),
+        precision_factor=parameter_properties.BatchedComponentProperties(),
+        precision=parameter_properties.BatchedComponentProperties())
+
   @property
   def loc(self):
     # Note: if the `loc` kwarg is None, this is `None`.
@@ -229,6 +238,48 @@ class MultivariateNormalPrecisionFactorLinearOperator(
   @property
   def precision(self):
     return self._precision
+
+  experimental_is_sharded = False
+
+  def _mean(self):
+    shape = tensorshape_util.concatenate(self.batch_shape, self.event_shape)
+    has_static_shape = tensorshape_util.is_fully_defined(shape)
+    if not has_static_shape:
+      shape = tf.concat([
+          self.batch_shape_tensor(),
+          self.event_shape_tensor(),
+      ], 0)
+
+    if self.loc is None:
+      return tf.zeros(shape, self.dtype)
+
+    return tf.broadcast_to(self.loc, shape)
+
+  def _covariance(self):
+    if self._precision is None:
+      inv_precision_factor = self._precision_factor.inverse()
+      cov = inv_precision_factor.matmul(inv_precision_factor, adjoint=True)
+    else:
+      cov = self._precision.inverse()
+    return cov.to_dense()
+
+  def _variance(self):
+    if self._precision is None:
+      precision = self._precision_factor.matmul(
+          self._precision_factor, adjoint_arg=True)
+    else:
+      precision = self._precision
+    variance = precision.inverse().diag_part()
+    return tf.broadcast_to(
+        variance,
+        ps.broadcast_shape(ps.shape(variance),
+                           ps.shape(self.loc)))
+
+  def _stddev(self):
+    return tf.sqrt(self._variance())
+
+  def _mode(self):
+    return self._mean()
 
   def _log_prob_unnormalized(self, value):
     """Unnormalized log probability.
@@ -265,8 +316,9 @@ class MultivariateNormalPrecisionFactorLinearOperator(
     Returns:
       Floating point `Tensor` with batch shape.
     """
-    return (-0.5 * tf.cast(self.event_shape[-1], self.dtype) *
-            np.log(2 * np.pi) +
+    dim = self.precision_factor.domain_dimension_tensor()
+    return (ps.cast(-0.5 * np.log(2 * np.pi), self.dtype) *
+            ps.cast(dim, self.dtype) +
             # Notice the sign on the LinearOperator.log_abs_determinant is
             # positive, since it is precision_factor not scale.
             self._precision_factor.log_abs_determinant() +

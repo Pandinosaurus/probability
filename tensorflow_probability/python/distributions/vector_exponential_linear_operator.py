@@ -19,11 +19,11 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow.compat.v2 as tf
-from tensorflow_probability.python.bijectors import affine_linear_operator as affine_linear_operator_bijector
 from tensorflow_probability.python.bijectors import chain as chain_bijector
-from tensorflow_probability.python.bijectors import scale_matvec_linear_operator as scale_matvec_linear_operator_bijector
+from tensorflow_probability.python.bijectors import scale_matvec_linear_operator
 from tensorflow_probability.python.bijectors import shift as shift_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import exponential
 from tensorflow_probability.python.distributions import sample
 from tensorflow_probability.python.distributions import transformed_distribution
@@ -52,6 +52,7 @@ or
 
 
 class VectorExponentialLinearOperator(
+    distribution.AutoCompositeTensorDistribution,
     transformed_distribution.TransformedDistribution):
   """The vectorization of the Exponential distribution on `R^k`.
 
@@ -122,8 +123,8 @@ class VectorExponentialLinearOperator(
   vex = tfd.VectorExponentialLinearOperator(
       scale=tf.linalg.LinearOperatorFullMatrix(mat))
 
-  # Compute the pdf of an`R^2` observation; return a scalar.
-  vex.prob([1., 2.]).eval()  # shape: []
+  # Compute the pdf of an `R^2` observation; return a scalar.
+  vex.prob([1., 2.])  # shape: []
 
   # Initialize a 2-batch of 3-variate Vector Exponential's.
   mu = [[1., 2, 3],
@@ -138,7 +139,7 @@ class VectorExponentialLinearOperator(
   # Compute the pdf of two `R^3` observations; return a length-2 vector.
   x = [[1.9, 2.2, 3.1],
        [10., 1.0, 9.0]]     # shape: [2, 3]
-  vex.prob(x).eval()    # shape: [2]
+  vex.prob(x)    # shape: [2]
   ```
 
   """
@@ -181,6 +182,8 @@ class VectorExponentialLinearOperator(
       TypeError: if not `scale.dtype.is_floating`
     """
     parameters = dict(locals())
+    if loc is None:
+      loc = 0.0  # Implicit value for backwards compatibility.
     if scale is None:
       raise ValueError('Missing required `scale` parameter.')
     if not dtype_util.is_floating(scale.dtype):
@@ -189,11 +192,14 @@ class VectorExponentialLinearOperator(
     with tf.name_scope(name) as name:
       # Since expand_dims doesn't preserve constant-ness, we obtain the
       # non-dynamic value if possible.
+      # TODO(b/190433277): Verify GradientTape safety and use
+      # `convert_nonref_to_tensor` on `loc`.
       loc = loc if loc is None else tf.convert_to_tensor(
           loc, name='loc', dtype=scale.dtype)
       batch_shape, event_shape = distribution_util.shapes_from_loc_and_scale(
           loc, scale)
-
+      self._loc = loc
+      self._scale = scale
       super(VectorExponentialLinearOperator, self).__init__(
           # TODO(b/137665504): Use batch-adding meta-distribution to set the
           # batch shape instead of tf.ones.
@@ -206,8 +212,9 @@ class VectorExponentialLinearOperator(
                   rate=tf.ones(batch_shape, dtype=scale.dtype),
                   allow_nan_stats=allow_nan_stats),
               event_shape),
-          bijector=affine_linear_operator_bijector.AffineLinearOperator(
-              shift=loc, scale=scale, validate_args=validate_args),
+          bijector=shift_bijector.Shift(shift=loc)(
+              scale_matvec_linear_operator.ScaleMatvecLinearOperator(
+                  scale=scale, validate_args=validate_args)),
           validate_args=validate_args,
           name=name)
       self._parameters = parameters
@@ -215,12 +222,14 @@ class VectorExponentialLinearOperator(
   @property
   def loc(self):
     """The `loc` `Tensor` in `Y = scale @ X + loc`."""
-    return self.bijector.shift
+    return self._loc
 
   @property
   def scale(self):
     """The `scale` `LinearOperator` in `Y = scale @ X + loc`."""
-    return self.bijector.scale
+    return self._scale
+
+  experimental_is_sharded = False
 
   @distribution_util.AppendDocstring(_mvn_sample_note)
   def _log_prob(self, x):
@@ -236,7 +245,7 @@ class VectorExponentialLinearOperator(
     # Then this distribution is
     #   X = loc + LW,
     # and then E[X] = loc + L1, where 1 is the vector of ones.
-    scale_x_ones = self.bijector.scale.matvec(
+    scale_x_ones = self.scale.matvec(
         tf.ones(self._mode_mean_shape(), self.dtype))
 
     if self.loc is None:
@@ -252,34 +261,37 @@ class VectorExponentialLinearOperator(
     # and then since Cov(wi, wj) = 1 if i=j, and 0 otherwise,
     #   Cov(X) = L Cov(W W^T) L^T = L L^T.
     if distribution_util.is_diagonal_scale(self.scale):
-      return tf.linalg.diag(tf.square(self.scale.diag_part()))
+      answer = tf.linalg.diag(tf.square(self.scale.diag_part()))
     else:
-      return self.scale.matmul(self.scale.to_dense(), adjoint_arg=True)
+      answer = self.scale.matmul(self.scale.to_dense(), adjoint_arg=True)
+    return self._broadcast_covariance_like_with_loc(answer)
 
   def _variance(self):
     if distribution_util.is_diagonal_scale(self.scale):
-      return tf.square(self.scale.diag_part())
+      answer = tf.square(self.scale.diag_part())
     elif (isinstance(self.scale, tf.linalg.LinearOperatorLowRankUpdate) and
           self.scale.is_self_adjoint):
-      return tf.linalg.diag_part(self.scale.matmul(self.scale.to_dense()))
+      answer = tf.linalg.diag_part(self.scale.matmul(self.scale.to_dense()))
     else:
-      return tf.linalg.diag_part(
+      answer = tf.linalg.diag_part(
           self.scale.matmul(self.scale.to_dense(), adjoint_arg=True))
+    return self._broadcast_variance_like_with_loc(answer)
 
   def _stddev(self):
     if distribution_util.is_diagonal_scale(self.scale):
-      return tf.abs(self.scale.diag_part())
+      answer = tf.abs(self.scale.diag_part())
     elif (isinstance(self.scale, tf.linalg.LinearOperatorLowRankUpdate) and
           self.scale.is_self_adjoint):
-      return tf.sqrt(
+      answer = tf.sqrt(
           tf.linalg.diag_part(self.scale.matmul(self.scale.to_dense())))
     else:
-      return tf.sqrt(
+      answer = tf.sqrt(
           tf.linalg.diag_part(
               self.scale.matmul(self.scale.to_dense(), adjoint_arg=True)))
+    return self._broadcast_variance_like_with_loc(answer)
 
   def _mode(self):
-    scale_x_zeros = self.bijector.scale.matvec(
+    scale_x_zeros = self.scale.matvec(
         tf.zeros(self._mode_mean_shape(), self.dtype))
 
     if self.loc is None:
@@ -311,7 +323,24 @@ class VectorExponentialLinearOperator(
   def _default_event_space_bijector(self):
     return chain_bijector.Chain([
         shift_bijector.Shift(shift=self.loc, validate_args=self.validate_args),
-        scale_matvec_linear_operator_bijector.ScaleMatvecLinearOperator(
+        scale_matvec_linear_operator.ScaleMatvecLinearOperator(
             scale=self.scale, validate_args=self.validate_args),
         softplus_bijector.Softplus(validate_args=self.validate_args)
     ], validate_args=self.validate_args)
+
+  def _broadcast_variance_like_with_loc(self, item):
+    if self.loc is None:
+      return item
+    return item + tf.zeros_like(self.loc)
+
+  def _broadcast_covariance_like_with_loc(self, item):
+    if self.loc is None:
+      return item
+    if tensorshape_util.rank(self.loc.shape) == 0:
+      # Scalar loc is irrelevant; but this check only works if that's
+      # known statically.
+      return item
+    event_shape = self.event_shape_tensor()
+    cov_shape = tf.concat(
+        [self.batch_shape_tensor(), event_shape, event_shape], axis=0)
+    return tf.broadcast_to(item, cov_shape)

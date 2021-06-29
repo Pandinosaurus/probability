@@ -24,8 +24,10 @@ import functools
 import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python.bijectors import bijector
+from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.internal import tensorshape_util
 
@@ -56,7 +58,7 @@ _SplineShared = collections.namedtuple(
     'SplineShared', 'out_of_bounds,x_k,y_k,d_k,d_kp1,h_k,w_k,s_k')
 
 
-class RationalQuadraticSpline(bijector.Bijector):
+class RationalQuadraticSpline(bijector.AutoCompositeTensorBijector):
   """A piecewise rational quadratic spline, as developed in [1].
 
   This transformation represents a monotonically increasing piecewise rational
@@ -202,6 +204,27 @@ class RationalQuadraticSpline(bijector.Bijector):
           validate_args=validate_args,
           parameters=parameters,
           name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict(
+        bin_widths=parameter_properties.ParameterProperties(
+            event_ndims=1,
+            shape_fn=parameter_properties.SHAPE_FN_NOT_IMPLEMENTED,
+            default_constraining_bijector_fn=parameter_properties
+            .BIJECTOR_NOT_IMPLEMENTED),
+        bin_heights=parameter_properties.ParameterProperties(
+            event_ndims=1,
+            shape_fn=parameter_properties.SHAPE_FN_NOT_IMPLEMENTED,
+            default_constraining_bijector_fn=parameter_properties
+            .BIJECTOR_NOT_IMPLEMENTED),
+        knot_slopes=parameter_properties.ParameterProperties(
+            event_ndims=1,
+            shape_fn=parameter_properties.SHAPE_FN_NOT_IMPLEMENTED,
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))),
+        range_min=parameter_properties.ParameterProperties(
+            shape_fn=parameter_properties.SHAPE_FN_NOT_IMPLEMENTED,))
 
   @property
   def bin_widths(self):

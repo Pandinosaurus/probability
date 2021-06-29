@@ -38,9 +38,12 @@ with util.silence_nonrewritten_import_errors():
   from inference_gym.targets.model import Model
   from inference_gym.targets.neals_funnel import NealsFunnel
   from inference_gym.targets.non_identifiable_quartic import NonIdentifiableQuarticMeasurementModel
+  from inference_gym.targets.plasma_spectroscopy import PlasmaSpectroscopy
+  from inference_gym.targets.plasma_spectroscopy import SyntheticPlasmaSpectroscopy
   from inference_gym.targets.probit_regression import GermanCreditNumericProbitRegression
   from inference_gym.targets.probit_regression import ProbitRegression
   from inference_gym.targets.radon_contextual_effects import RadonContextualEffects
+  from inference_gym.targets.radon_contextual_effects import RadonContextualEffectsHalfNormalMinnesota
   from inference_gym.targets.radon_contextual_effects import RadonContextualEffectsMinnesota
   from inference_gym.targets.sparse_logistic_regression import GermanCreditNumericSparseLogisticRegression
   from inference_gym.targets.sparse_logistic_regression import SparseLogisticRegression
@@ -48,6 +51,8 @@ with util.silence_nonrewritten_import_errors():
   from inference_gym.targets.stochastic_volatility import StochasticVolatilitySP500
   from inference_gym.targets.stochastic_volatility import StochasticVolatilitySP500Small
   from inference_gym.targets.vectorized_stochastic_volatility import VectorizedStochasticVolatility
+  from inference_gym.targets.vectorized_stochastic_volatility import VectorizedStochasticVolatilityLogSP500
+  from inference_gym.targets.vectorized_stochastic_volatility import VectorizedStochasticVolatilityLogSP500Small
   from inference_gym.targets.vectorized_stochastic_volatility import VectorizedStochasticVolatilitySP500
   from inference_gym.targets.vectorized_stochastic_volatility import VectorizedStochasticVolatilitySP500Small
   from inference_gym.targets.vector_model import VectorModel
@@ -74,8 +79,10 @@ __all__ = [
     'Model',
     'NealsFunnel',
     'NonIdentifiableQuarticMeasurementModel',
+    'PlasmaSpectroscopy',
     'ProbitRegression',
     'RadonContextualEffects',
+    'RadonContextualEffectsHalfNormalMinnesota',
     'RadonContextualEffectsMinnesota',
     'SparseLogisticRegression',
     'StochasticVolatility',
@@ -83,7 +90,10 @@ __all__ = [
     'StochasticVolatilitySP500Small',
     'SyntheticItemResponseTheory',
     'SyntheticLogGaussianCoxProcess',
+    'SyntheticPlasmaSpectroscopy',
     'VectorizedStochasticVolatility',
+    'VectorizedStochasticVolatilityLogSP500',
+    'VectorizedStochasticVolatilityLogSP500Small',
     'VectorizedStochasticVolatilitySP500',
     'VectorizedStochasticVolatilitySP500Small',
     'VectorModel',

@@ -45,6 +45,7 @@ py_library(
         ":model",
         ":neals_funnel",
         ":non_identifiable_quartic",
+        ":plasma_spectroscopy",
         ":probit_regression",
         ":radon_contextual_effects",
         ":sparse_logistic_regression",
@@ -373,6 +374,34 @@ py_test(
 )
 
 py_library(
+    name = "plasma_spectroscopy",
+    srcs = ["plasma_spectroscopy.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":bayesian_model",
+        ":model",
+        # numpy dep,
+        "//inference_gym/internal:data",
+    ],
+)
+
+# py_strict
+py_test(
+    name = "plasma_spectroscopy_test",
+    srcs = ["plasma_spectroscopy_test.py"],
+    python_version = "PY3",
+    srcs_version = "PY3",
+    deps = [
+        ":plasma_spectroscopy",
+        # absl/testing:parameterized dep,
+        # numpy dep,
+        # tensorflow dep,
+        # tensorflow_probability/python/internal:test_util dep,
+        "//inference_gym/internal:test_util",
+    ],
+)
+
+py_library(
     name = "probit_regression",
     srcs = ["probit_regression.py"],
     srcs_version = "PY3",
@@ -523,6 +552,8 @@ py_library(
         ":bayesian_model",
         ":model",
         "//inference_gym/internal:data",
+        "//inference_gym/targets/ground_truth:stochastic_volatility_log_sp500",
+        "//inference_gym/targets/ground_truth:stochastic_volatility_log_sp500_small",
         "//inference_gym/targets/ground_truth:stochastic_volatility_sp500",
         "//inference_gym/targets/ground_truth:stochastic_volatility_sp500_small",
     ],

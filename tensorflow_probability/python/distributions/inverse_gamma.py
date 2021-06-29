@@ -22,6 +22,7 @@ from __future__ import print_function
 import numpy as np
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python import math as tfp_math
 from tensorflow_probability.python.bijectors import chain as chain_bijector
 from tensorflow_probability.python.bijectors import reciprocal as reciprocal_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
@@ -31,7 +32,6 @@ from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import parameter_properties
-from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import reparameterization
 from tensorflow_probability.python.internal import tensor_util
 
@@ -41,7 +41,7 @@ __all__ = [
 ]
 
 
-class InverseGamma(distribution.Distribution):
+class InverseGamma(distribution.AutoCompositeTensorDistribution):
   """InverseGamma distribution.
 
   The `InverseGamma` distribution is defined over positive real numbers using
@@ -188,14 +188,6 @@ class InverseGamma(distribution.Distribution):
     """Scale parameter."""
     return self._scale
 
-  def _batch_shape_tensor(self):
-    return ps.broadcast_shape(
-        ps.shape(self.concentration), ps.shape(self.scale))
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(self.concentration.shape,
-                                     self.scale.shape)
-
   def _event_shape_tensor(self):
     return tf.constant([], dtype=tf.int32)
 
@@ -225,6 +217,10 @@ class InverseGamma(distribution.Distribution):
     # Note that igammac returns the upper regularized incomplete gamma
     # function Q(a, x), which is what we want for the CDF.
     return tf.math.igammac(self.concentration, self.scale / x)
+
+  def _quantile(self, p):
+    return tf.math.reciprocal(
+        tfp_math.igammacinv(self.concentration, p)) * self.scale
 
   def _entropy(self):
     concentration = tf.convert_to_tensor(self.concentration)

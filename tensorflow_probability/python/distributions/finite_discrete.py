@@ -21,12 +21,17 @@ from __future__ import print_function
 import numpy as np
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python.bijectors import invert as invert_bijector
+from tensorflow_probability.python.bijectors import ordered as ordered_bijector
+from tensorflow_probability.python.bijectors import softmax_centered as softmax_centered_bijector
+from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.distributions import categorical
 from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import distribution_util as dist_util
 from tensorflow_probability.python.internal import dtype_util
-from tensorflow_probability.python.internal import prefer_static
+from tensorflow_probability.python.internal import parameter_properties
+from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import reparameterization
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.internal import tensorshape_util
@@ -36,7 +41,7 @@ __all__ = [
 ]
 
 
-class FiniteDiscrete(distribution.Distribution):
+class FiniteDiscrete(distribution.AutoCompositeTensorDistribution):
   """The finite discrete distribution.
 
   The FiniteDiscrete distribution is parameterized by either probabilities or
@@ -142,9 +147,36 @@ class FiniteDiscrete(distribution.Distribution):
         name=name)
 
   @classmethod
-  def _params_event_ndims(cls):
-    # outcomes is currently not sliceable.
-    return dict(logits=1, probs=1)
+  def _parameter_properties(cls, dtype, num_classes=None):
+    # pylint: disable=g-long-lambda
+    return dict(
+        outcomes=parameter_properties.ParameterProperties(
+            event_ndims=None,
+            shape_fn=lambda sample_shape: [num_classes],
+            default_constraining_bijector_fn=invert_bijector.Invert(
+                ordered_bijector.Ordered())),
+        logits=parameter_properties.ParameterProperties(
+            event_ndims=1,
+            shape_fn=lambda sample_shape: ps.concat(
+                [sample_shape, [num_classes]], axis=0)),
+        probs=parameter_properties.ParameterProperties(
+            event_ndims=1,
+            shape_fn=lambda sample_shape: ps.concat(
+                [sample_shape, [num_classes]], axis=0),
+            default_constraining_bijector_fn=softmax_centered_bijector
+            .SoftmaxCentered,
+            is_preferred=False),
+        rtol=parameter_properties.ParameterProperties(
+            event_ndims=None,  # TODO(b/187469130): standardize batch semantics.
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype))),
+            is_preferred=False),
+        atol=parameter_properties.ParameterProperties(
+            event_ndims=None,  # TODO(b/187469130): standardize batch semantics.
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype))),
+            is_preferred=False))
+    # pylint: enable=g-long-lambda
 
   @property
   def outcomes(self):
@@ -160,12 +192,6 @@ class FiniteDiscrete(distribution.Distribution):
     """Input argument `probs`."""
     return self._categorical.probs
 
-  def _batch_shape_tensor(self):
-    return self._categorical.batch_shape_tensor()
-
-  def _batch_shape(self):
-    return self._categorical.batch_shape
-
   def _event_shape_tensor(self):
     return tf.constant([], dtype=tf.int32)
 
@@ -178,8 +204,7 @@ class FiniteDiscrete(distribution.Distribution):
     upper_bound = tf.searchsorted(self.outcomes, values=flat_x, side='right')
     values_at_ub = tf.gather(
         self.outcomes,
-        indices=tf.minimum(upper_bound,
-                           prefer_static.shape(self.outcomes)[-1] - 1))
+        indices=tf.minimum(upper_bound, ps.shape(self.outcomes)[-1] - 1))
     should_use_upper_bound = self._is_equal_or_close(flat_x, values_at_ub)
     indices = tf.where(should_use_upper_bound, upper_bound, upper_bound - 1)
     indices = tf.reshape(indices, shape=dist_util.prefer_static_shape(x))
@@ -203,7 +228,7 @@ class FiniteDiscrete(distribution.Distribution):
         tf.reshape(
             tf.searchsorted(
                 self.outcomes, values=tf.reshape(x, shape=[-1]), side='right'),
-            prefer_static.shape(x)))
+            ps.shape(x)))
     use_right_indices = self._is_equal_or_close(
         x, tf.gather(self.outcomes, indices=right_indices))
     left_indices = tf.maximum(0, right_indices - 1)
@@ -238,7 +263,7 @@ class FiniteDiscrete(distribution.Distribution):
 
   def _variance(self):
     probs = self._categorical.probs_parameter()
-    outcomes = tf.broadcast_to(self.outcomes, shape=prefer_static.shape(probs))
+    outcomes = tf.broadcast_to(self.outcomes, shape=ps.shape(probs))
     if dtype_util.is_integer(outcomes.dtype):
       if self._validate_args:
         outcomes = dist_util.embed_check_integer_casting_closed(
@@ -331,7 +356,3 @@ class FiniteDiscrete(distribution.Distribution):
               message='outcomes is not strictly increasing.'))
 
     return assertions
-
-  _composite_tensor_nonshape_params = ('outcomes', 'logits', 'probs', 'rtol',
-                                       'atol')
-  # 'outcomes' is not in _params_event_ndims(), so we expose this manually

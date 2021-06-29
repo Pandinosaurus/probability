@@ -136,17 +136,23 @@ class _StsTestHarness(object):
         loc=-2. + tf.zeros([model.latent_size]),
         scale_diag=3. * tf.ones([model.latent_size]))
 
+    mask = tf.convert_to_tensor(
+        [False, True, True, False, False, False, False, True, False, False],
+        dtype=tf.bool)
+
     # Verify we build the LGSSM without errors.
     ssm = model.make_state_space_model(
         num_timesteps=10,
         param_vals=dummy_param_vals,
         initial_state_prior=initial_state_prior,
-        initial_step=1)
+        initial_step=1,
+        mask=mask)
 
-    # Verify that the child class passes the initial step and prior arguments
-    # through to the SSM.
+    # Verify that the child class passes the initial step, prior, and mask
+    # arguments through to the SSM.
     self.assertEqual(self.evaluate(ssm.initial_step), 1)
     self.assertEqual(ssm.initial_state_prior, initial_state_prior)
+    self.assertAllEqual(ssm.mask, mask)
 
     # Verify the model has the correct latent size.
     self.assertEqual(
@@ -213,7 +219,7 @@ class _StsTestHarness(object):
     observed_time_series = np.array(
         [1.0, 2.0, -1000., 0.4, np.nan, 1000., 4.2, np.inf]).astype(np.float32)
     observation_mask = np.array(
-        [False, False, True, False, True, True, False, True]).astype(np.bool)
+        [False, False, True, False, True, True, False, True]).astype(np.bool_)
     masked_time_series = tfp.sts.MaskedTimeSeries(observed_time_series,
                                                   is_missing=observation_mask)
 

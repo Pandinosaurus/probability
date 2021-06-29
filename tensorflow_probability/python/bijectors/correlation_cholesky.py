@@ -32,7 +32,7 @@ __all__ = [
 ]
 
 
-class CorrelationCholesky(bijector.Bijector):
+class CorrelationCholesky(bijector.AutoCompositeTensorBijector):
   """Maps unconstrained reals to Cholesky-space correlation matrices.
 
   #### Mathematical Details
@@ -123,6 +123,10 @@ class CorrelationCholesky(bijector.Bijector):
           inverse_min_event_ndims=2,
           parameters=parameters,
           name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict()
 
   def _forward_event_shape(self, input_shape):
     if tensorshape_util.rank(input_shape) is None:

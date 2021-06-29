@@ -23,6 +23,7 @@ from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import reparameterization
 from tensorflow_probability.python.internal import samplers
@@ -54,7 +55,7 @@ def _broadcast_event_and_samples(event, samples, event_ndims):
   return event, samples
 
 
-class Empirical(distribution.Distribution):
+class Empirical(distribution.AutoCompositeTensorDistribution):
   """Empirical distribution.
 
   The Empirical distribution is parameterized by a [batch] multiset of samples.
@@ -123,7 +124,7 @@ class Empirical(distribution.Distribution):
     """Initialize `Empirical` distributions.
 
     Args:
-      samples: Numeric `Tensor` of shape [B1, ..., Bk, S, E1, ..., En]`,
+      samples: Numeric `Tensor` of shape `[B1, ..., Bk, S, E1, ..., En]`,
         `k, n >= 0`. Samples or batches of samples on which the distribution
         is based. The first `k` dimensions index into a batch of independent
         distributions. Length of `S` dimension determines number of samples
@@ -169,12 +170,11 @@ class Empirical(distribution.Distribution):
           parameters=parameters,
           name=name)
 
-  @staticmethod
-  def _param_shapes(sample_shape):
-    return {'samples': tf.convert_to_tensor(sample_shape, dtype=tf.int32)}
-
-  def _params_event_ndims(self):
-    return dict(samples=self._event_ndims + 1)
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    return dict(
+        samples=parameter_properties.ParameterProperties(
+            event_ndims=lambda self: self._event_ndims + 1))  # pylint: disable=protected-access
 
   @property
   def samples(self):
@@ -199,16 +199,6 @@ class Empirical(distribution.Distribution):
         samples_shape[self._samples_axis],
         dtype_hint=tf.int32,
         name='num_samples')
-
-  def _batch_shape_tensor(self, samples=None):
-    if samples is None:
-      samples = tf.convert_to_tensor(self.samples)
-    return ps.shape(samples)[:self._samples_axis]
-
-  def _batch_shape(self):
-    if tensorshape_util.rank(self.samples.shape) is None:
-      return tf.TensorShape(None)
-    return self.samples.shape[:self._samples_axis]
 
   def _event_shape_tensor(self, samples=None):
     if samples is None:
@@ -272,12 +262,12 @@ class Empirical(distribution.Distribution):
     # Flatten samples for each batch.
     if self._event_ndims == 0:
       flattened_samples = tf.reshape(samples, [-1, num_samples])
-      mode_shape = self._batch_shape_tensor(samples)
+      mode_shape = self._batch_shape_tensor(samples=samples)
     else:
       event_size = tf.reduce_prod(self._event_shape_tensor(samples))
       mode_shape = ps.concat(
-          [self._batch_shape_tensor(samples),
-           self._event_shape_tensor(samples)],
+          [self._batch_shape_tensor(samples=samples),
+           self._event_shape_tensor(samples=samples)],
           axis=0)
       flattened_samples = tf.reshape(samples, [-1, num_samples, event_size])
 
@@ -292,7 +282,7 @@ class Empirical(distribution.Distribution):
   def _entropy(self):
     samples = tf.convert_to_tensor(self.samples)
     num_samples = self._compute_num_samples(samples)
-    entropy_shape = self._batch_shape_tensor(samples)
+    entropy_shape = self._batch_shape_tensor(samples=samples)
 
     # Flatten samples for each batch.
     if self._event_ndims == 0:

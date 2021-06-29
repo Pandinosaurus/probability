@@ -30,7 +30,6 @@ from tensorflow_probability.python.distributions import lkj
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import parameter_properties
-from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import reparameterization
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.internal import tensorshape_util
@@ -41,7 +40,7 @@ __all__ = [
 ]
 
 
-class CholeskyLKJ(distribution.Distribution):
+class CholeskyLKJ(distribution.AutoCompositeTensorDistribution):
   """The CholeskyLKJ distribution on cholesky factors of correlation matrices.
 
   This is a one-parameter family of distributions on cholesky factors of
@@ -148,12 +147,6 @@ class CholeskyLKJ(distribution.Distribution):
     """Concentration parameter."""
     return self._concentration
 
-  def _batch_shape_tensor(self):
-    return ps.shape(self.concentration)
-
-  def _batch_shape(self):
-    return self.concentration.shape
-
   def _event_shape_tensor(self):
     return tf.constant([self.dimension, self.dimension], dtype=tf.int32)
 
@@ -165,7 +158,7 @@ class CholeskyLKJ(distribution.Distribution):
 
     Args:
       num_samples: Python `int`. The number of samples to draw.
-      seed: Python integer seed for RNG
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
       name: Python `str` name prefixed to Ops created by this function.
 
     Returns:
@@ -258,7 +251,7 @@ class CholeskyLKJ(distribution.Distribution):
       logpi = np.log(np.pi)
       ans = tf.zeros_like(concentration)
       for k in range(1, self.dimension):
-        ans = ans + logpi * (k / 2.)
+        ans = ans + tf.constant(logpi * k / 2., concentration.dtype)
         effective_concentration = concentration + (self.dimension - 1 - k) / 2.
         ans = ans + tfp_math.log_gamma_difference(
             k / 2., effective_concentration)

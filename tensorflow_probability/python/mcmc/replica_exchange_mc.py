@@ -25,6 +25,7 @@ import numpy as np
 import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python.internal import assert_util
+from tensorflow_probability.python.internal import broadcast_util as bu
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import samplers
@@ -109,6 +110,13 @@ class ReplicaExchangeMCKernelResults(
             # Count of how many steps have been taken. May be used to determine
             # swaps.
             'step_count',
+
+            # The tempered part of the (possibly unnormalized) log prob,
+            # evaluated at each replica sample.
+            # If the kth replica has density
+            #   p_k(x) = exp(-beta_k * U(x)) * f_k(x),
+            # this is U(x), for every replica's `x`. Shape is [num_replica, ...]
+            'potential_energy',
         ])):
   """Internal state and diagnostics for Replica Exchange MC."""
   __slots__ = ()
@@ -173,7 +181,7 @@ def default_swap_proposal_fn(prob_swap, name=None):
       u = samplers.uniform(u_shape, seed=parity_seed) < 0.5
       u = tf.where(num_replica > 2, u, False)
 
-      x = mcmc_util.left_justified_expand_dims_to(
+      x = bu.left_justified_expand_dims_to(
           ps.range(num_replica, dtype=tf.int64),
           rank=ps.size(u_shape))
       y = tf.where(tf.equal(x % 2, tf.cast(u, dtype=tf.int64)), x + 1, x - 1)
@@ -261,7 +269,7 @@ def even_odd_swap_proposal_fn(swap_frequency, name=None):
                                    tf.bool))
       u = tf.where(num_replica > 2, u, False)
 
-      x = mcmc_util.left_justified_expand_dims_to(
+      x = bu.left_justified_expand_dims_to(
           tf.range(num_replica, dtype=tf.int64),
           rank=ps.size(u_shape))
       y = tf.where(tf.equal(x % 2, tf.cast(u, dtype=tf.int64)), x + 1, x - 1)
@@ -300,7 +308,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
   `untempered_log_prob_fn`. In this case, the `kth` replica samples from
   density `p_k(x)` with
   `log(p_k(x)) = beta_k * tempered_log_prob_fn(x) + untempered_log_prob_fn(x)`.
-  The this case, `beta` may be zero, and one often sets `beta[-1]` to zero.
+  In this case, `beta` may be zero, and one often sets `beta[-1]` to zero.
   This means the last replica samples using `untempered_log_prob_fn`.
   In the Bayesian setup, `untempered_log_prob_fn` will often be the log prior,
   and `tempered_log_prob_fn` the likelihood.
@@ -555,7 +563,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
       previous_kernel_results: A (possibly nested) `tuple`, `namedtuple` or
         `list` of `Tensor`s representing internal calculations made within the
         previous call to this function (or as returned by `bootstrap_results`).
-      seed: Optional, a seed for reproducible sampling.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
     Returns:
       next_state: `Tensor` or Python `list` of `Tensor`s representing the
@@ -631,7 +639,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
           pre_swap_replica_target_log_prob)
       num_replica = ps.size0(inverse_temperatures)
 
-      inverse_temperatures = mcmc_util.left_justified_broadcast_to(
+      inverse_temperatures = bu.left_justified_broadcast_to(
           inverse_temperatures, replica_and_batch_shape)
 
       # Now that each replica has done one_step, it is time to consider swaps.
@@ -664,7 +672,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
                 seed=swap_seed),
             dtype=tf.int32)
 
-      null_swaps = mcmc_util.left_justified_expand_dims_like(
+      null_swaps = bu.left_justified_expand_dims_like(
           tf.range(num_replica, dtype=swaps.dtype), swaps)
       swaps = _maybe_embed_swaps_validation(swaps, null_swaps,
                                             self.validate_args)
@@ -673,7 +681,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
       if self.tempered_log_prob_fn is None:
         # Efficient way of re-evaluating target_log_prob_fn on the
         # pre_swap_replica_states.
-        untempered_energy_ignoring_ulp = (
+        untempered_negative_energy_ignoring_ulp = (
             # Since untempered_log_prob_fn is None, we may assume
             # inverse_temperatures > 0 (else the target is improper).
             pre_swap_replica_target_log_prob / inverse_temperatures)
@@ -685,7 +693,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
         # a 1 <--> 2 swap is...
         #   (p_1(x_2) p_2(x_1)) / (p_1(x_1) p_2(x_2))
         # which depends only on f(x), since terms involving g(x) cancel.
-        untempered_energy_ignoring_ulp = self.tempered_log_prob_fn(
+        untempered_negative_energy_ignoring_ulp = self.tempered_log_prob_fn(
             *pre_swap_replica_states)
 
       # Since `swaps` is its own inverse permutation we automatically know the
@@ -702,9 +710,9 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
       # untempered_pre_swap_replica_target_log_prob, and hence does not factor
       # into energy_diff. Why? Because, it cancels out in the acceptance ratio.
       energy_diff = (
-          untempered_energy_ignoring_ulp -
+          untempered_negative_energy_ignoring_ulp -
           mcmc_util.index_remapping_gather(
-              untempered_energy_ignoring_ulp,
+              untempered_negative_energy_ignoring_ulp,
               swaps, name='gather_swap_tlp'))
       swapped_inverse_temperatures = mcmc_util.index_remapping_gather(
           inverse_temperatures, swaps, name='gather_swap_temps')
@@ -712,7 +720,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
 
       # If i and j are swapping, log_accept_ratio[] i and j are equal.
       log_accept_ratio = (
-          energy_diff * mcmc_util.left_justified_expand_dims_to(
+          energy_diff * bu.left_justified_expand_dims_to(
               inverse_temp_diff, replica_and_batch_rank))
 
       log_accept_ratio = tf.where(
@@ -740,14 +748,14 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
       post_swap_replica_states = [
           _swap_tensor(s) for s in pre_swap_replica_states]
 
-      expanded_null_swaps = mcmc_util.left_justified_broadcast_to(
+      expanded_null_swaps = bu.left_justified_broadcast_to(
           null_swaps, replica_and_batch_shape)
       is_swap_proposed = _compute_swap_notmatrix(
           # Broadcast both so they have shape [num_replica] + batch_shape.
           # This (i) makes them have same shape as is_swap_accepted, and
           # (ii) keeps shape consistent if someday swaps has a batch shape.
           expanded_null_swaps,
-          mcmc_util.left_justified_broadcast_to(swaps, replica_and_batch_shape))
+          bu.left_justified_broadcast_to(swaps, replica_and_batch_shape))
 
       # To get is_swap_accepted in ordered position, we use
       # _compute_swap_notmatrix on current and next replica positions.
@@ -788,6 +796,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
           swaps=swaps,
           step_count=previous_kernel_results.step_count + 1,
           seed=seed,
+          potential_energy=-untempered_negative_energy_ignoring_ulp,
       )
 
       return states, post_swap_kernel_results
@@ -821,7 +830,7 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
           raise ValueError(
               'Number of replicas implied by initial state ({}) must equal '
               'number of replicas implied by inverse_temperatures ({}), but '
-              'did not'.format(it_n_replica, state_n_replica))
+              'did not'.format(state_n_replica, it_n_replica))
 
       # We will now replicate each of a possible batch of initial stats, one for
       # each inverse_temperature. So if init_state=[x, y] of shapes [Sx, Sy]
@@ -868,11 +877,11 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
           pre_swap_replica_target_log_prob)
       batch_shape = replica_and_batch_shape[1:]
 
-      inverse_temperatures = mcmc_util.left_justified_broadcast_to(
+      inverse_temperatures = bu.left_justified_broadcast_to(
           inverse_temperatures, replica_and_batch_shape)
 
       # Pretend we did a "null swap", which will always be accepted.
-      swaps = mcmc_util.left_justified_broadcast_to(
+      swaps = bu.left_justified_broadcast_to(
           tf.range(num_replica), replica_and_batch_shape)
       # is_swap_accepted.shape = [n_replica, n_replica] + batch_shape.
       is_swap_accepted = distribution_util.rotate_transpose(
@@ -891,7 +900,13 @@ class ReplicaExchangeMC(kernel_base.TransitionKernel):
           swaps=swaps,
           step_count=tf.zeros(shape=(), dtype=tf.int32),
           seed=samplers.zeros_seed(),
+          potential_energy=tf.zeros_like(pre_swap_replica_target_log_prob),
       )
+
+  def experimental_with_shard_axes(self, shard_axes):
+    def new_make_kernel_fn(tlp):
+      return self.make_kernel_fn(tlp).experimental_with_shard_axes(shard_axes)
+    return self.copy(make_kernel_fn=new_make_kernel_fn)
 
 
 def _make_replica_target_log_prob_fn(
@@ -907,7 +922,7 @@ def _make_replica_target_log_prob_fn(
     else:
       tlp = target_log_prob_fn(*x)
 
-    log_prob = tf.cast(mcmc_util.left_justified_expand_dims_like(
+    log_prob = tf.cast(bu.left_justified_expand_dims_like(
         inverse_temperatures, tlp), dtype=tlp.dtype) * tlp
 
     if untempered_log_prob_fn is not None:
@@ -942,6 +957,7 @@ def _maybe_embed_inverse_temperature_validation(
     using_untempered_log_prob,
 ):
   """Return `inverse_temperatures`, possibly with embedded asserts."""
+
   if not validate_args:
     return inverse_temperatures
 

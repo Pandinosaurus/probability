@@ -27,21 +27,25 @@ py_library(
     name = "numpy",
     srcs = ["__init__.py"],
     deps = [
+        ":__internal__",
         ":bitwise",
         ":compat",
+        ":composite_tensor",
         ":config",
         ":control_flow",
+        ":data_structures",
         ":debugging",
         ":deprecation",
         ":dtype",
         ":errors",
         ":functional_ops",
-        ":keras",
         ":linalg",
         ":misc",
         ":nest",
+        ":nested_structure_coder",
         ":nn",
         ":numpy_array",
+        ":numpy_keras",
         ":numpy_logging",
         ":numpy_math",
         ":numpy_signal",
@@ -49,12 +53,24 @@ py_library(
         ":private",
         ":random_generators",
         ":raw_ops",
+        ":resource_variable_ops",
         ":sets_lib",
         ":sparse_lib",
         ":static_rewrites",
         ":tensor_array_ops",
+        ":tensor_spec",
         ":test_lib",
         ":tf_inspect",
+        ":type_spec",
+        ":variables",
+    ],
+)
+
+py_library(
+    name = "__internal__",
+    srcs = ["__internal__.py"],
+    deps = [
+        ":composite_tensor",
     ],
 )
 
@@ -77,6 +93,11 @@ py_library(
 )
 
 py_library(
+    name = "composite_tensor",
+    srcs = ["composite_tensor.py"],
+)
+
+py_library(
     name = "config",
     srcs = ["config.py"],
 )
@@ -90,6 +111,12 @@ py_library(
         ":ops",
         # numpy dep,
     ],
+)
+
+py_library(
+    name = "data_structures",
+    srcs = ["data_structures.py"],
+    deps = [],
 )
 
 py_library(
@@ -144,8 +171,8 @@ py_library(
 )
 
 py_library(
-    name = "keras",
-    srcs = ["keras.py"],
+    name = "numpy_keras",
+    srcs = ["numpy_keras.py"],
     deps = [
         ":_utils",
         ":keras_layers",
@@ -191,6 +218,11 @@ py_library(
     deps = [
         # tree dep,
     ],
+)
+
+py_library(
+    name = "nested_structure_coder",
+    srcs = ["nested_structure_coder.py"],
 )
 
 py_library(
@@ -311,6 +343,11 @@ py_library(
 )
 
 py_library(
+    name = "resource_variable_ops",
+    srcs = ["resource_variable_ops.py"],
+)
+
+py_library(
     name = "sets_lib",
     srcs = ["sets_lib.py"],
     deps = [
@@ -340,6 +377,7 @@ py_library(
     testonly = 1,
     srcs = ["tensor_shape_gen.py"],
     deps = [
+        # absl/logging dep,
         # six dep,
     ],
 )
@@ -361,9 +399,27 @@ py_library(
 )
 
 py_library(
+    name = "tensor_spec",
+    srcs = ["tensor_spec.py"],
+)
+
+py_library(
+    name = "type_spec",
+    srcs = ["type_spec.py"],
+)
+
+py_library(
+    name = "variables",
+    srcs = ["variables.py"],
+    deps = [
+        ":ops",
+    ],
+)
+
+py_library(
     name = "numpy_testlib",
     testonly = 1,
-    srcs_version = "PY2AND3",
+    srcs_version = "PY3",
     deps = [
         ":numpy",
         # absl/testing:parameterized dep,

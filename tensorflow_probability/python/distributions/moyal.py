@@ -26,10 +26,10 @@ from tensorflow_probability.python.bijectors import identity as identity_bijecto
 from tensorflow_probability.python.bijectors import invert as invert_bijector
 from tensorflow_probability.python.bijectors import moyal_cdf as moyal_cdf_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import kullback_leibler
 from tensorflow_probability.python.distributions import transformed_distribution
 from tensorflow_probability.python.distributions import uniform
-from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
@@ -39,7 +39,10 @@ __all__ = [
 ]
 
 
-class Moyal(transformed_distribution.TransformedDistribution):
+# TODO(b/182603117): Remove `AutoCompositeTensor` subclass when
+# `TransformedDistribution` is converted to `CompositeTensor`.
+class Moyal(transformed_distribution.TransformedDistribution,
+            distribution.AutoCompositeTensorDistribution):
   """The Moyal distribution with location `loc` and `scale` parameters.
 
   #### Mathematical details
@@ -165,13 +168,12 @@ class Moyal(transformed_distribution.TransformedDistribution):
       # cause samples to lie in `(inf, -inf]` instead of `(inf, -inf)`. To fix
       # this, we use `np.finfo(dtype_util.as_numpy_dtype(self.dtype).tiny`
       # because it is the smallest, positive, 'normal' number.
-      batch_shape = distribution_util.get_broadcast_shape(loc, scale)
       super(Moyal, self).__init__(
           # TODO(b/137665504): Use batch-adding meta-distribution to set the
           # batch shape instead of tf.ones.
           distribution=uniform.Uniform(
               low=np.finfo(dtype_util.as_numpy_dtype(dtype)).tiny,
-              high=tf.ones(batch_shape, dtype=dtype),
+              high=tf.ones([], dtype=dtype),
               allow_nan_stats=allow_nan_stats),
           # The Moyal bijector encodes the CDF function as the forward,
           # and hence needs to be inverted.
@@ -199,6 +201,8 @@ class Moyal(transformed_distribution.TransformedDistribution):
   def scale(self):
     """Distribution parameter for scale."""
     return self._moyal_bijector.scale
+
+  experimental_is_sharded = False
 
   def _entropy(self):
     # Use broadcasting rules to calculate the full broadcast sigma.

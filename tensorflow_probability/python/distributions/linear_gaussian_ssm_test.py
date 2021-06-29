@@ -704,7 +704,7 @@ class _MissingObservationsTests(test_util.TestCase):
   # One test requires derivative with respect to
   # transition_noise.scale_diag so we allow this to be
   # passed in as an argument if needed.
-  def make_model(self, scale_diag=None):
+  def make_model(self, scale_diag=None, **kwargs):
     if scale_diag is None:
       scale_diag = np.array([1.], dtype=np.float32)
 
@@ -728,7 +728,8 @@ class _MissingObservationsTests(test_util.TestCase):
         initial_state_prior=initial_state_prior,
         initial_step=0,
         experimental_parallelize=self.parallelize,
-        validate_args=True)
+        validate_args=True,
+        **kwargs)
 
     return (num_timesteps, transition_matrix, transition_noise,
             observation_matrix, observation_noise,
@@ -743,7 +744,7 @@ class _MissingObservationsTests(test_util.TestCase):
         [1.0, 2.0, -1000., 0.4, np.nan, 1000., 4.2, np.inf]).astype(np.float32)
     observed_time_series_ = observed_time_series_[..., np.newaxis]
     observation_mask_ = np.array(
-        [False, False, True, False, True, True, False, True]).astype(np.bool)
+        [False, False, True, False, True, True, False, True]).astype(np.bool_)
 
     # Pass inputs with dynamic shape. Ideally we would run all tests with
     # both static and dynamic shape, but since LGSSM tests are unusually
@@ -841,7 +842,7 @@ class _MissingObservationsTests(test_util.TestCase):
            np.nan, 1000., 4.2, np.inf]).astype(np.float32)
       observed_time_series = observed_time_series[..., np.newaxis]
       observation_mask = np.array(
-          [False, False, True, False, True, True, False, True]).astype(np.bool)
+          [False, False, True, False, True, True, False, True]).astype(np.bool_)
 
       # Check that we've avoided the NaN-gradient gotcha described in
       # https://stackoverflow.com/questions/33712178/tensorflow-nan-bug/42497444#42497444
@@ -941,6 +942,36 @@ class _MissingObservationsTests(test_util.TestCase):
        _) = model.forward_filter(
            x=observed_time_series, mask=big_mask)
 
+  def testInitSetsDefaultMask(self):
+
+    observed_time_series = np.arange(8, dtype=np.float32)[..., np.newaxis]
+    observation_mask = np.array(
+        [False, False, True, False, True, True, False, True]).astype(np.bool_)
+
+    _, _, _, _, _, _, model = self.make_model()
+    _, _, _, _, _, _, model_with_mask = self.make_model(mask=observation_mask)
+
+    self.assertAllEqual(
+        model_with_mask.log_prob(observed_time_series),
+        model.log_prob(observed_time_series, mask=observation_mask))
+    self.assertAllEqual(
+        model_with_mask.prob(observed_time_series),
+        model.prob(observed_time_series, mask=observation_mask))
+    self.assertAllEqualNested(
+        model_with_mask.forward_filter(observed_time_series),
+        model.forward_filter(observed_time_series, mask=observation_mask))
+    self.assertAllEqualNested(
+        model_with_mask.posterior_marginals(observed_time_series),
+        model.posterior_marginals(observed_time_series, mask=observation_mask))
+    self.assertAllEqual(
+        model_with_mask.posterior_sample(
+            observed_time_series,
+            seed=test_util.test_seed(sampler_type='stateless')),
+        model.posterior_sample(
+            observed_time_series,
+            mask=observation_mask,
+            seed=test_util.test_seed(sampler_type='stateless')))
+
 
 class MissingObservationsTestsSequential(_MissingObservationsTests):
   parallelize = False
@@ -1002,7 +1033,7 @@ class _KalmanSmootherTest(test_util.TestCase):
     if self.compile:
       self.skip_if_no_xla()
       filter_and_smooth = tf.function(filter_and_smooth, autograph=False,
-                                      experimental_compile=True)
+                                      jit_compile=True)
     [
         filtered_means,
         filtered_covs,
@@ -1131,7 +1162,7 @@ class _KalmanSmootherTest(test_util.TestCase):
       self.skip_if_no_xla()
       sample_and_marginals = tf.function(sample_and_marginals,
                                          autograph=False,
-                                         experimental_compile=True)
+                                         jit_compile=True)
     posterior_samples, posterior_mean, posterior_covs = sample_and_marginals()
     self.assertAllEqual(posterior_samples.shape,
                         sample_shape + [1, 1, 5, 3])
@@ -1450,8 +1481,8 @@ class _KalmanStepsTest(object):
     self.assertAllClose(*self.evaluate((predictive_dist.mean(),
                                         predictive_dist_extended.mean()[:1])))
     self.assertAllClose(
-        *self.evaluate((predictive_dist.covariance(),
-                        predictive_dist_extended.covariance()[:1, :1])))
+        *self.evaluate((predictive_dist.stddev(),
+                        predictive_dist_extended.stddev()[:1])))
 
   def testMeanStep(self):
     prev_mean = np.asarray([[-2], [.4]], dtype=np.float32)

@@ -50,6 +50,7 @@ __all__ = [
     'reverse',
     'repeat',
     'roll',
+    'sequence_mask',
     'searchsorted',
     'shape',
     'size',
@@ -196,11 +197,9 @@ def _linspace(start, stop, num, name=None, axis=0):  # pylint: disable=unused-ar
   if np.issubdtype(start.dtype, np.integer):
     start = start.astype(np.float64)
   stop = ops.convert_to_tensor(stop, dtype=start.dtype)
-  num = ops.convert_to_tensor(num, dtype_hint=np.int32)
-  if not np.issubdtype(num.dtype, np.integer):
+  if not np.issubdtype(np.array(num).dtype, np.integer):
     raise TypeError('`num` must be an integer but got {}'.format(num.dtype))
-  num = num.astype(np.int32)
-  return np.linspace(start, stop, num, axis=axis).astype(start.dtype)
+  return np.linspace(start, stop, int(num), axis=axis).astype(start.dtype)
 
 
 def _one_hot(  # pylint: disable=unused-argument
@@ -221,7 +220,6 @@ def _one_hot(  # pylint: disable=unused-argument
   else:
     dtype = utils.numpy_dtype(dtype)
   indices = np.array(indices)
-  depth = np.array(depth)
   pred = abs(np.arange(depth, dtype=indices.dtype) -
              indices[..., np.newaxis]) > 0
   y_out = np.where(pred, np.array(off_value, dtype), np.array(on_value, dtype))
@@ -231,7 +229,8 @@ def _one_hot(  # pylint: disable=unused-argument
 
 
 def _ones_like(input, dtype=None, name=None):  # pylint: disable=redefined-builtin,unused-argument
-  return np.ones_like(input, dtype=utils.numpy_dtype(dtype))
+  return np.ones_like(ops.convert_to_tensor(input),
+                      dtype=utils.numpy_dtype(dtype))
 
 
 # TODO(b/136555907): Add unit-test.
@@ -275,6 +274,13 @@ def _reverse(tensor, axis, name=None):  # pylint: disable=unused-argument
   for ax in axis:
     tensor = np.flip(tensor, ax)
   return tensor
+
+
+def _sequence_mask(lengths, maxlen=None, dtype=np.bool_, name=None):  # pylint: disable=unused-argument
+  lengths = np.array(lengths, dtype=np.int32)
+  if maxlen is None:
+    maxlen = np.max(lengths).astype(lengths.dtype)
+  return (np.arange(maxlen) < lengths[..., np.newaxis]).astype(dtype)
 
 
 if JAX_MODE:
@@ -340,6 +346,9 @@ def _slice(input_, begin, size, name=None):  # pylint: disable=unused-argument,r
 
 def _split(value, num_or_size_splits, axis=0, num=None, name='split'):  # pylint: disable=unused-argument
   """Map tf.split -> np.split."""
+  if np.isscalar(num_or_size_splits):
+    return np.split(value, num_or_size_splits, axis)
+
   indices_or_sections = onp.array(num_or_size_splits)
   if indices_or_sections.ndim == 1:
     if any(idx == -1 for idx in indices_or_sections):
@@ -384,7 +393,7 @@ expand_dims = utils.copy_docstring(
 
 fill = utils.copy_docstring(
     'tf.fill',
-    lambda dims, value, name=None: np.full(dims, value))
+    lambda dims, value, name=None: np.full(dims, ops.convert_to_tensor(value)))
 
 gather = utils.copy_docstring(
     'tf.gather',
@@ -446,6 +455,10 @@ reshape = utils.copy_docstring(
 roll = utils.copy_docstring(
     'tf.roll',
     lambda input, shift, axis: np.roll(input, shift, axis))  # pylint: disable=unnecessary-lambda
+
+sequence_mask = utils.copy_docstring(
+    'tf.sequence_mask',
+    _sequence_mask)
 
 searchsorted = utils.copy_docstring(
     'tf.searchsorted',

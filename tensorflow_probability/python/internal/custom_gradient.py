@@ -26,6 +26,7 @@ from tensorflow.python.ops import array_ops  # pylint: disable=g-direct-tensorfl
 JAX_MODE = False
 
 if JAX_MODE:
+  import jax  # pylint: disable=g-import-not-at-top
   from jax import custom_jvp  # pylint: disable=g-import-not-at-top
 
 
@@ -41,8 +42,11 @@ def custom_gradient(vjp_fwd=None, vjp_bwd=None, jvp_fn=None,
 
   Args:
     vjp_fwd: A function (*args) => (output, auxiliaries).
-    vjp_bwd: A function (auxiliaries, output_gradient) => args_gradients.
-    jvp_fn: A function (primals, tangents) => (primal_out, tangent_out).
+    vjp_bwd: A function (auxiliaries, output_gradient) =>
+      nondiff_args_gradients. `None` gradients will be inserted into the correct
+      positions for `nondiff_argnums`.
+    jvp_fn: A function (*nondiff_args, primals, tangents) =>
+      (primal_out, tangent_out).
     nondiff_argnums: Tuple of argument indices which are not differentiable.
 
   Returns:
@@ -89,8 +93,9 @@ def custom_gradient(vjp_fwd=None, vjp_bwd=None, jvp_fn=None,
           val, aux = vjp_fwd(*reconstruct_args, **kwargs)
 
           def vjp_bwd_wrapped(*g):
+            nondiff_args = [closure[i] for i in nondiff_argnums]
             result = tf.nest.flatten(
-                vjp_bwd(aux, tf.nest.pack_sequence_as(val, g)))
+                vjp_bwd(*nondiff_args, aux, tf.nest.pack_sequence_as(val, g)))
             for i in nondiff_argnums:
               result = tuple(result[:i]) + (None,) + tuple(result[i:])
             result = [a for i, a in enumerate(result) if i not in closure]
@@ -126,3 +131,9 @@ if JAX_MODE:
 
   def prevent_gradient(x, message='', name=None):  # pylint: disable=unused-argument,function-redefined
     return _prevent_gradient_helper({message: x})[message]
+
+
+def is_valid_gradient(grad):
+  if JAX_MODE:
+    return grad.dtype != jax.float0
+  return grad is not None

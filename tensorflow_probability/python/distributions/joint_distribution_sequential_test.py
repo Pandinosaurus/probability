@@ -19,7 +19,6 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import warnings
 
 # Dependency imports
 from absl.testing import parameterized
@@ -30,7 +29,7 @@ import tensorflow.compat.v2 as tf
 import tensorflow_probability as tfp
 
 from tensorflow_probability.python.distributions import joint_distribution_sequential
-from tensorflow_probability.python.internal import samplers
+from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import test_util
 
 from tensorflow.python.util import tf_inspect  # pylint: disable=g-direct-tensorflow-import
@@ -293,32 +292,6 @@ class JointDistributionSequentialTest(test_util.TestCase):
     lp = d.log_prob(x)
     self.assertEqual((2, 3), lp.shape)
 
-  def test_sample_shape_propagation_nondefault_behavior(self):
-    d = tfd.JointDistributionSequential(
-        [
-            tfd.Independent(tfd.Exponential(rate=[100, 120]), 1),          # 0
-            lambda e: tfd.Gamma(concentration=e[..., 0], rate=e[..., 1]),  # 1
-            tfd.HalfNormal(2.5),                                           # 2
-            lambda s: tfd.Normal(loc=0, scale=s),                          # 3
-            tfd.Exponential(2),                                            # 4
-            lambda df, loc, _, scale: tfd.StudentT(df, loc, scale),        # 5
-        ],
-        validate_args=False)  # So log_prob doesn't complain.
-    # The following enables the nondefault sample shape behavior.
-    d._always_use_specified_sample_shape = True
-    sample_shape = (2, 3)
-    x = d.sample(sample_shape, seed=test_util.test_seed())
-    self.assertLen(x, 6)
-    self.assertEqual(sample_shape + (2,), x[0].shape)
-    self.assertEqual(sample_shape * 2, x[1].shape)  # Has 1 arg.
-    self.assertEqual(sample_shape * 1, x[2].shape)  # Has 0 args.
-    self.assertEqual(sample_shape * 2, x[3].shape)  # Has 1 arg.
-    self.assertEqual(sample_shape * 1, x[4].shape)  # Has 0 args.
-    # Has 3 args, one being scalar.
-    self.assertEqual(sample_shape * 3, x[5].shape)
-    lp = d.log_prob(x)
-    self.assertEqual(sample_shape * 3, lp.shape)
-
   def test_argspec(self):
     argspec = tf_inspect.getfullargspec(Dummy)
     self.assertAllEqual(['me', 'arg1', 'arg2', 'arg3'], argspec.args)
@@ -341,6 +314,66 @@ class JointDistributionSequentialTest(test_util.TestCase):
         lambda a: tfd.Normal(a, 1.)], validate_args=True)
     lp = dist.log_prob(dist.sample(5, seed=test_util.test_seed()))
     self.assertAllEqual(self.evaluate(lp).shape, [5])
+
+  def test_dist_fn_takes_varargs(self):
+    dist = tfd.JointDistributionSequential(
+        [
+            tfb.Scale(-1.)(tfd.Exponential(1.)),  # Negative.
+            lambda *args: tfd.Exponential(tf.exp(args[0])),  # Positive.
+            lambda *args: tfd.Normal(loc=args[1],  # pylint: disable=g-long-lambda
+                                     scale=args[0],  # Must be positive.
+                                     validate_args=True)
+        ], validate_args=True)
+    lp = dist.log_prob(dist.sample(5, seed=test_util.test_seed()))
+    self.assertAllEqual(lp.shape, [5])
+
+  @parameterized.named_parameters(
+      ('_sample', lambda d, **kwargs: d.sample(**kwargs)),
+      ('_sample_and_log_prob',
+       lambda d, **kwargs: d.experimental_sample_and_log_prob(**kwargs)[0]),
+  )
+  def test_nested_partial_value(self, sample_fn):
+    innermost = tfd.JointDistributionSequential((
+        tfd.Exponential(1.),
+        lambda a: tfd.Sample(tfd.LogNormal(a, a), [5]),
+    ))
+
+    inner = tfd.JointDistributionSequential((
+        tfd.Exponential(1.),
+        innermost,
+    ))
+
+    outer = tfd.JointDistributionSequential((
+        tfd.Exponential(1.),
+        inner,
+    ))
+
+    seed = test_util.test_seed(sampler_type='stateless')
+    true_xs = outer.sample(seed=seed)
+
+    def _update(tuple_, index, value):
+      res = list(tuple_)
+      res[index] = value
+      return tuple(res)
+
+    # These asserts work because we advance the stateless seed inside the model
+    # whether or not a sample is actually generated.
+    partial_xs = _update(true_xs, 1, None)
+    xs = sample_fn(outer, value=partial_xs, seed=seed)
+    self.assertAllCloseNested(true_xs, xs)
+
+    partial_xs = _update(true_xs, 0, None)
+    xs = sample_fn(outer, value=partial_xs, seed=seed)
+    self.assertAllCloseNested(true_xs, xs)
+
+    partial_xs = _update(true_xs, 1, _update(true_xs[1], 1, None))
+    xs = sample_fn(outer, value=partial_xs, seed=seed)
+    self.assertAllCloseNested(true_xs, xs)
+
+    partial_xs = _update(
+        true_xs, 1, _update(true_xs[1], 1, _update(true_xs[1][1], 0, None)))
+    xs = sample_fn(outer, value=partial_xs, seed=seed)
+    self.assertAllCloseNested(true_xs, xs)
 
   @parameterized.named_parameters(
       ('basic', basic_model_fn),
@@ -378,7 +411,7 @@ class JointDistributionSequentialTest(test_util.TestCase):
         ValueError, r'Joint distribution expected values for [0-9] components'):
       d.log_prob(badvar=27.)
 
-    with self.assertRaisesRegexp(TypeError, 'unexpected keyword argument'):
+    with self.assertRaisesRegexp(ValueError, 'unexpected keyword argument'):
       d.log_prob(*value, extra_arg=27.)
 
   def test_can_call_prob_with_args_and_kwargs(self):
@@ -469,6 +502,7 @@ class JointDistributionSequentialTest(test_util.TestCase):
     self.assertEqual(lp.shape, [7, 9])
 
   @test_util.jax_disable_variable_test
+  @test_util.numpy_disable_variable_test
   def test_latent_dirichlet_allocation(self):
     """Tests Latent Dirichlet Allocation joint model.
 
@@ -555,8 +589,7 @@ class JointDistributionSequentialTest(test_util.TestCase):
         indices=tf.cast(
             tau[..., tf.newaxis] < tf.linspace(0., 1., n),
             dtype=tf.int32),
-        # TODO(b/139204153): Remove static value hack after bug closed.
-        batch_dims=int(tf.get_static_value(tf.rank(tau))))
+        batch_dims=ps.rank(tau))
 
     alpha = tf.math.reciprocal(tf.reduce_mean(count_data))
 
@@ -712,6 +745,28 @@ class JointDistributionSequentialTest(test_util.TestCase):
         ValueError, r'Supplied both `value` and keyword arguments .*'):
       joint.sample(seed=seed, a=1., value=[1., None, None])
 
+  def test_creates_valid_coroutine(self):
+    joint = tfd.JointDistributionSequential(
+        [
+            tfd.Poisson(rate=100.),
+            tfd.Dirichlet(concentration=[1., 1.]),
+            lambda theta, n: tfd.Multinomial(total_count=n, probs=theta),
+            lambda z: tfd.Independent(  # pylint: disable=g-long-lambda
+                tfd.Multinomial(total_count=z, logits=[[0., 1., 2.],
+                                                       [3., 4., 5.]]),
+                reinterpreted_batch_ndims=1),
+        ],
+        validate_args=True)
+    sample_shapes = [
+        x.shape for x in joint._model_flatten(
+            joint.sample([5], seed=test_util.test_seed()))]
+
+    jdc = tfd.JointDistributionCoroutine(joint._model_coroutine)
+    jdc_sample_shapes = [
+        x.shape for x in jdc._model_flatten(
+            jdc.sample([5], seed=test_util.test_seed()))]
+    self.assertAllEqualNested(sample_shapes, jdc_sample_shapes)
+
 
 class ResolveDistributionNamesTest(test_util.TestCase):
 
@@ -773,60 +828,6 @@ class ResolveDistributionNamesTest(test_util.TestCase):
           dist_names=None,
           leaf_name='y',
           instance_names=['z', None])
-
-  @test_util.jax_disable_test_missing_functionality('stateful samplers')
-  @test_util.numpy_disable_test_missing_functionality('stateful samplers')
-  def test_legacy_dists(self):
-
-    class StatefulNormal(tfd.Normal):
-
-      def _sample_n(self, n, seed=None):
-        return self.loc + self.scale * tf.random.normal(
-            tf.concat([[n], self.batch_shape_tensor()], axis=0),
-            seed=seed)
-
-    d = tfd.JointDistributionSequential(
-        [
-            tfd.Independent(tfd.Exponential(rate=[100, 120]), 1),
-            lambda e: tfd.Gamma(concentration=e[..., 0], rate=e[..., 1]),
-            StatefulNormal(loc=0, scale=2.),
-            tfd.Normal,  # Or, `lambda loc, scale: tfd.Normal(loc, scale)`.
-            lambda m: tfd.Sample(tfd.Bernoulli(logits=m), 12),
-        ],
-        validate_args=True)
-
-    warnings.simplefilter('always')
-    with warnings.catch_warnings(record=True) as w:
-      d.sample(seed=test_util.test_seed())
-    self.assertRegexpMatches(
-        str(w[0].message),
-        r'Falling back to stateful sampling for distribution #2.*of type.*'
-        r'StatefulNormal.*component name "loc" and `dist.name` "Normal"',
-        msg=w)
-
-  @test_util.jax_disable_test_missing_functionality('stateful samplers')
-  @test_util.numpy_disable_test_missing_functionality('stateful samplers')
-  def test_legacy_dists_stateless_seed_raises(self):
-
-    class StatefulNormal(tfd.Normal):
-
-      def _sample_n(self, n, seed=None):
-        return self.loc + self.scale * tf.random.normal(
-            tf.concat([[n], self.batch_shape_tensor()], axis=0),
-            seed=seed)
-
-    d = tfd.JointDistributionSequential(
-        [
-            tfd.Independent(tfd.Exponential(rate=[100, 120]), 1),
-            lambda e: tfd.Gamma(concentration=e[..., 0], rate=e[..., 1]),
-            StatefulNormal(loc=0, scale=2.),
-            tfd.Normal,  # Or, `lambda loc, scale: tfd.Normal(loc, scale)`.
-            lambda m: tfd.Sample(tfd.Bernoulli(logits=m), 12),
-        ],
-        validate_args=True)
-
-    with self.assertRaisesRegexp(TypeError, r'Expected int for argument'):
-      d.sample(seed=samplers.zeros_seed())
 
 
 if __name__ == '__main__':

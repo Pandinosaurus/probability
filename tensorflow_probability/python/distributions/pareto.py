@@ -39,7 +39,7 @@ from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.util.deferred_tensor import DeferredTensor
 
 
-class Pareto(distribution.Distribution):
+class Pareto(distribution.AutoCompositeTensorDistribution):
   """Pareto distribution.
 
   The Pareto distribution is parameterized by a `scale` and a
@@ -124,15 +124,6 @@ class Pareto(distribution.Distribution):
     """Concentration parameter for this distribution."""
     return self._concentration
 
-  def _batch_shape_tensor(self, concentration=None, scale=None):
-    return ps.broadcast_shape(
-        ps.shape(
-            self.concentration if concentration is None else concentration),
-        ps.shape(self.scale if scale is None else scale))
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(self.concentration.shape, self.scale.shape)
-
   def _event_shape(self):
     return tf.TensorShape([])
 
@@ -144,8 +135,13 @@ class Pareto(distribution.Distribution):
          self._batch_shape_tensor(concentration=concentration, scale=scale)],
         axis=0)
     sampled = samplers.uniform(shape, maxval=1., seed=seed, dtype=self.dtype)
-    log_sample = tf.math.log(scale) - tf.math.log1p(-sampled) / concentration
-    return tf.exp(log_sample)
+    log_std_sample = -tf.math.log1p(-sampled) / concentration
+    std_sample = tf.math.exp(log_std_sample)
+    return tf.where(
+        std_sample > 0.,
+        # This expression is more accurate when std_sample doesn't underflow.
+        scale * std_sample,
+        tf.math.exp(tf.math.log(scale) + log_std_sample))
 
   def _log_prob(self, x):
     concentration = tf.convert_to_tensor(self.concentration)
@@ -156,9 +152,11 @@ class Pareto(distribution.Distribution):
     ] if self.validate_args else []):
 
       def log_prob_on_support(z):
-        return (tf.math.log(concentration) +
-                concentration * tf.math.log(scale) -
-                (concentration + 1.) * tf.math.log(z))
+        # This can also be written as log(c) + c * log(s) - (c + 1) * log(z).
+        # However, when c >> 1 and s and z are of the same magnitude, this can
+        # lead to loss of precision (log(c) vs. log(c) - log(z)).
+        return (tf.math.log(concentration / z) +
+                concentration * tf.math.log(scale / z))
 
       return self._extend_support(
           x, scale, log_prob_on_support, alt=-np.inf)

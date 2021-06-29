@@ -37,7 +37,10 @@ __all__ = [
     'det',
     'diag',
     'diag_part',
+    'eig',
     'eigh',
+    'eigvals',
+    'eigvalsh',
     'einsum',
     'eye',
     'inv',
@@ -58,7 +61,6 @@ __all__ = [
     'trace',
     'triangular_solve',
     # 'cross',
-    # 'eigvalsh',
     # 'expm',
     # 'global_norm',
     # 'logm',
@@ -132,6 +134,30 @@ def _eye(num_rows, num_columns=None, batch_shape=None,
   if batch_shape is not None:
     x = x * np.ones(tuple(batch_shape) + (1, 1)).astype(dt)
   return x
+
+
+def _eig(tensor, name=None):
+  del name
+  tensor = ops.convert_to_tensor(tensor)
+  e, v = np.linalg.eig(tensor)
+  dt = tensor.dtype
+  if dt == np.float32:
+    out_dtype = np.complex64
+  elif dt == np.float64:
+    out_dtype = np.complex128
+  return e.astype(out_dtype), v.astype(out_dtype)
+
+
+def _eigvals(tensor, name=None):
+  del name
+  tensor = ops.convert_to_tensor(tensor)
+  e = np.linalg.eigvals(tensor)
+  dt = tensor.dtype
+  if dt == np.float32:
+    out_dtype = np.complex64
+  elif dt == np.float64:
+    out_dtype = np.complex128
+  return e.astype(out_dtype)
 
 
 def _lu_pivot_to_permutation(swaps, m):
@@ -252,7 +278,7 @@ def _qr(input, full_matrices=False, name=None):  # pylint: disable=redefined-bui
 def _set_diag(input, diagonal, name=None, k=0, align='RIGHT_LEFT'):  # pylint: disable=unused-argument,redefined-builtin
   if k != 0 or align != 'RIGHT_LEFT':
     raise NotImplementedError('set_diag not implemented for k != 0')
-  return np.where(np.eye(diagonal.shape[-1], dtype=np.bool),
+  return np.where(np.eye(diagonal.shape[-1], dtype=np.bool_),
                   diagonal[..., np.newaxis, :],
                   input)
 
@@ -365,9 +391,17 @@ diag_part = utils.copy_docstring(
     lambda input, name=None: np.diagonal(  # pylint: disable=g-long-lambda
         ops.convert_to_tensor(input), axis1=-2, axis2=-1))
 
+eig = utils.copy_docstring('tf.linalg.eig', _eig)
+
 eigh = utils.copy_docstring(
     'tf.linalg.eigh',
     lambda tensor, name=None: np.linalg.eigh(tensor))
+
+eigvals = utils.copy_docstring('tf.linalg.eigvals', _eigvals)
+
+eigvalsh = utils.copy_docstring(
+    'tf.linalg.eigvalsh',
+    lambda tensor, name=None: np.linalg.eigvalsh(tensor))
 
 einsum = utils.copy_docstring(
     'tf.linalg.einsum',

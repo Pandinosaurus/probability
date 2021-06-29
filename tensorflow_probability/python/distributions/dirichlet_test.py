@@ -76,13 +76,13 @@ class DirichletTest(test_util.TestCase):
     dist = tfd.Dirichlet(concentration, validate_args=True)
     log_prob = self.evaluate(dist.log_prob(x))
     self.assertAllEqual(
-        np.ones_like(log_prob, dtype=np.bool), np.isfinite(log_prob))
+        np.ones_like(log_prob, dtype=np.bool_), np.isfinite(log_prob))
 
     # Test when concentration[k] = 1., and x is zero at various dimensions.
     dist = tfd.Dirichlet(10 * [1.])
     log_prob = self.evaluate(dist.log_prob(x))
     self.assertAllEqual(
-        np.ones_like(log_prob, dtype=np.bool), np.isfinite(log_prob))
+        np.ones_like(log_prob, dtype=np.bool_), np.isfinite(log_prob))
 
   def testPdfOnBoundaryWhenAlphaGreaterThanOne(self):
     dist = tfd.Dirichlet(9 * [2.])
@@ -307,6 +307,19 @@ class DirichletTest(test_util.TestCase):
     with self.assertRaisesOpError('must be non-negative|must sum to `1`'):
       self.evaluate(dist.experimental_default_event_space_bijector(
           ).inverse([0.7, 0.3, -eps]))
+
+  def testPdfOutsideSupport(self):
+    def mk_dist(c):
+      return tfd.Dirichlet(c, force_probs_to_zero_outside_support=True)
+    self.assertAllFinite(mk_dist([1., 1, 1]).log_prob([1, 0, 0]))
+    self.assertAllEqual(mk_dist([1., .9, 1]).log_prob([1, 0, 0]), float('inf'))
+    self.assertAllEqual(
+        mk_dist([1., 1, 1]).log_prob([1., .1, -.1]), -float('inf'))
+    self.assertAllEqual(
+        mk_dist([1., 1.1, 1]).log_prob([.9, 0, .1]), -float('inf'))
+    self.assertAllFinite(mk_dist([4., 3, 2]).log_prob([.7, .2, .1]))
+    self.assertAllEqual(
+        mk_dist([4., 3, 2]).log_prob([.7, .21, .1]), -float('inf'))
 
 
 @test_util.test_all_tf_execution_regimes

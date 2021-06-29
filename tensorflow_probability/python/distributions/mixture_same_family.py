@@ -29,6 +29,7 @@ from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import custom_gradient as tfp_custom_gradient
 from tensorflow_probability.python.internal import distribution_util as distribution_utils
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import reparameterization
 from tensorflow_probability.python.internal import samplers
@@ -78,7 +79,7 @@ class MixtureSameFamily(distribution.Distribution):
   # Plot PDF.
   x = np.linspace(-2., 3., int(1e4), dtype=np.float32)
   import matplotlib.pyplot as plt
-  plt.plot(x, gm.prob(x).eval());
+  plt.plot(x, gm.prob(x));
 
   ### Create a mixture of two Bivariate Gaussians:
 
@@ -104,7 +105,7 @@ class MixtureSameFamily(distribution.Distribution):
     grid = np.concatenate([gx.ravel()[None, :], gy.ravel()[None, :]], axis=0)
     return grid.T.reshape(x.size, y.size, 2)
   grid = meshgrid(np.linspace(-2, 2, 100, dtype=np.float32))
-  plt.contour(grid[..., 0], grid[..., 1], gm.prob(grid).eval());
+  plt.contour(grid[..., 0], grid[..., 1], gm.prob(grid));
 
   ```
 
@@ -199,16 +200,30 @@ class MixtureSameFamily(distribution.Distribution):
         self.components_distribution.event_shape)
 
   @property
-  def _composite_tensor_nonshape_params(self):
-    return ('mixture_distribution', 'components_distribution')
-
-  @property
   def mixture_distribution(self):
     return self._mixture_distribution
 
   @property
   def components_distribution(self):
     return self._components_distribution
+
+  @property
+  def experimental_is_sharded(self):
+    sharded = self.components_distribution.experimental_is_sharded
+    if self.mixture_distribution.experimental_is_sharded != sharded:
+      raise ValueError(
+          '`MixtureSameFamily.mixture_distribution` sharding must match '
+          '`MixtureSameFamily.components_distribution`.')
+    return sharded
+
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    return dict(
+        mixture_distribution=(
+            parameter_properties.BatchedComponentProperties()),
+        components_distribution=(
+            parameter_properties.BatchedComponentProperties(
+                event_ndims=1)))
 
   def __getitem__(self, slices):
     # Because slicing is parameterization-dependent, we only implement slicing
@@ -236,13 +251,6 @@ class MixtureSameFamily(distribution.Distribution):
     return self.copy(
         mixture_distribution=sliced_mixture_dist,
         components_distribution=sliced_components_dist)
-
-  def _batch_shape_tensor(self):
-    return self.components_distribution.batch_shape_tensor()[:-1]
-
-  def _batch_shape(self):
-    return tensorshape_util.with_rank_at_least(
-        self.components_distribution.batch_shape, 1)[:-1]
 
   def _event_shape_tensor(self):
     return self.components_distribution.event_shape_tensor()
@@ -453,7 +461,7 @@ class MixtureSameFamily(distribution.Distribution):
       3. Distributional transform currently only works for known rank of the
         batch tensor.
 
-    Arguments:
+    Args:
       x: Sample of mixture distribution
       event_shape: The event shape of this distribution
 
@@ -512,7 +520,7 @@ class MixtureSameFamily(distribution.Distribution):
       w_i^k = w_k prob_k(x_1, ..., x_i-1) / sum_k' w_k' prob_k'(x_1, ..., x_i-1)
     and w_0^k = w_k is the mixture probability of the k-th component.
 
-    Arguments:
+    Args:
       x: Sample of mixture distribution
       event_shape: The event shape of this distribution
 
@@ -682,7 +690,7 @@ def _prevent_2nd_derivative(x):
   NB: you need to apply a non-identity function to the output tensor for the
   exception to be raised.
 
-  Arguments:
+  Args:
     x: A tensor.
 
   Returns:

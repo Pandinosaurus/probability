@@ -21,6 +21,7 @@ from __future__ import print_function
 # Dependency imports
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python import math as tfp_math
 from tensorflow_probability.python.bijectors import identity as identity_bijector
 from tensorflow_probability.python.bijectors import scale as scale_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
@@ -43,7 +44,7 @@ __all__ = [
 ]
 
 
-class ExpGamma(distribution.Distribution):
+class ExpGamma(distribution.AutoCompositeTensorDistribution):
   """ExpGamma distribution.
 
   The ExpGamma distribution is defined over the real line using
@@ -59,7 +60,7 @@ class ExpGamma(distribution.Distribution):
   `tfb.Log()(tfd.Gamma(..))`):
 
   ```none
-  pdf(x; alpha, beta > 0) = exp(x)**(alpha - 1) exp(-exp(x) beta) / Z + x
+  pdf(x; alpha, beta > 0) = exp(x)**(alpha) exp(-exp(x) beta) / Z
   Z = Gamma(alpha) beta**(-alpha)
   ```
 
@@ -202,16 +203,6 @@ class ExpGamma(distribution.Distribution):
     """Log-rate parameter."""
     return self._log_rate
 
-  def _batch_shape_tensor(self):
-    rate_or_log_rate = self.log_rate if self.rate is None else self.rate
-    return ps.broadcast_shape(ps.shape(self.concentration),
-                              ps.shape(rate_or_log_rate))
-
-  def _batch_shape(self):
-    rate_or_log_rate = self.log_rate if self.rate is None else self.rate
-    return tf.broadcast_static_shape(self.concentration.shape,
-                                     rate_or_log_rate.shape)
-
   def _event_shape_tensor(self):
     return tf.constant([], dtype=tf.int32)
 
@@ -258,6 +249,12 @@ class ExpGamma(distribution.Distribution):
       y = tf.math.exp(x) * self.rate
     return tf.math.igamma(self.concentration, y)
 
+  def _quantile(self, p):
+    y = tfp_math.igammainv(self.concentration, p)
+    if self.rate is None:
+      return tf.math.log(y) - self.log_rate
+    return tf.math.log(y / self.rate)
+
   def _mean(self):
     return tf.math.digamma(self.concentration) - self._log_rate_parameter()
 
@@ -288,7 +285,10 @@ class ExpGamma(distribution.Distribution):
 kullback_leibler.RegisterKL(ExpGamma, ExpGamma)(gamma_lib.kl_gamma_gamma)
 
 
-class ExpInverseGamma(transformed_distribution.TransformedDistribution):
+# TODO(b/182603117): Remove `AutoCompositeTensor` subclass when
+# `TransformedDistribution` is converted to `CompositeTensor`.
+class ExpInverseGamma(transformed_distribution.TransformedDistribution,
+                      distribution.AutoCompositeTensorDistribution):
   """ExpInverseGamma distribution.
 
   The `ExpInverseGamma` distribution is defined over the real numbers such that
@@ -302,7 +302,7 @@ class ExpInverseGamma(transformed_distribution.TransformedDistribution):
   The probability density function (pdf) is very similar to ExpGamma,
 
   ```none
-  pdf(x; alpha, beta > 0) = exp(-x)**(alpha - 1) exp(-exp(-x) beta) / Z - x
+  pdf(x; alpha, beta > 0) = exp(-x)**(alpha) exp(-exp(-x) beta) / Z
   Z = Gamma(alpha) beta**(-alpha)
   ```
 
@@ -439,6 +439,8 @@ class ExpInverseGamma(transformed_distribution.TransformedDistribution):
   def log_scale(self):
     """Log of scale parameter."""
     return self.distribution.log_rate
+
+  experimental_is_sharded = False
 
   def _log_rate_parameter(self):  # Required by gamma_lib.kl_gamma_gamma.
     return self.distribution._log_rate_parameter()  # pylint: disable=protected-access

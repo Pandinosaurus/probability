@@ -46,6 +46,7 @@ multi_substrate_py_library(
         ":gradient",
         ":gram_schmidt",
         ":hypergeometric",
+        ":integration",
         ":interpolation",
         ":linalg",
         ":minimize",
@@ -66,7 +67,7 @@ multi_substrate_py_library(
     srcs = [
         "bessel.py",
     ],
-    srcs_version = "PY2AND3",
+    srcs_version = "PY3",
     deps = [
         # numpy dep,
         # tensorflow dep,
@@ -79,7 +80,7 @@ multi_substrate_py_test(
     name = "bessel_test",
     size = "medium",
     srcs = ["bessel_test.py"],
-    shard_count = 2,
+    shard_count = 7,
     deps = [
         # absl/testing:parameterized dep,
         # numpy dep,
@@ -119,7 +120,7 @@ multi_substrate_py_library(
     srcs = [
         "gram_schmidt.py",
     ],
-    srcs_version = "PY2AND3",
+    srcs_version = "PY3",
     deps = [
         # tensorflow dep,
         "//tensorflow_probability/python/internal:prefer_static",
@@ -160,6 +161,7 @@ multi_substrate_py_test(
     name = "generic_test",
     size = "medium",
     srcs = ["generic_test.py"],
+    shard_count = 3,
     deps = [
         # absl/testing:parameterized dep,
         # numpy dep,
@@ -199,7 +201,7 @@ multi_substrate_py_library(
     srcs = [
         "hypergeometric.py",
     ],
-    srcs_version = "PY2AND3",
+    srcs_version = "PY3",
     deps = [
         # numpy dep,
         # tensorflow dep,
@@ -212,14 +214,42 @@ multi_substrate_py_test(
     name = "hypergeometric_test",
     size = "medium",
     srcs = ["hypergeometric_test.py"],
+    jax_size = "large",
     shard_count = 3,
     deps = [
         # absl/testing:parameterized dep,
+        # mpmath dep,
         # numpy dep,
         # tensorflow dep,
         "//tensorflow_probability",
         "//tensorflow_probability/python/internal:test_util",
         "//tensorflow_probability/python/math:hypergeometric",
+    ],
+)
+
+multi_substrate_py_library(
+    name = "integration",
+    srcs = [
+        "integration.py",
+    ],
+    srcs_version = "PY3",
+    deps = [
+        # tensorflow dep,
+        "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:prefer_static",
+        "//tensorflow_probability/python/internal:tensorshape_util",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "integration_test",
+    srcs = ["integration_test.py"],
+    deps = [
+        # tensorflow dep,
+        "//tensorflow_probability",
+        "//tensorflow_probability/python/internal:hypothesis_testlib",
+        "//tensorflow_probability/python/internal:test_util",
+        # tensorflow/compiler/jit dep,
     ],
 )
 
@@ -243,7 +273,6 @@ multi_substrate_py_test(
     size = "small",
     srcs = ["interpolation_test.py"],
     jax_size = "medium",
-    numpy_tags = ["notap"],
     deps = [
         # numpy dep,
         # scipy dep,
@@ -393,7 +422,9 @@ multi_substrate_py_library(
     srcs_version = "PY3",
     deps = [
         # tensorflow dep,
+        "//tensorflow_probability/python/internal:callable_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:tensorshape_util",
     ],
 )
 
@@ -481,6 +512,7 @@ multi_substrate_py_test(
     name = "special_test",
     size = "medium",
     srcs = ["special_test.py"],
+    shard_count = 3,
     tags = ["tf1-broken"],
     deps = [
         # absl/testing:parameterized dep,

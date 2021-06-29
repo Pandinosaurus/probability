@@ -22,6 +22,7 @@ import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python.bijectors import bijector
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
 
 
@@ -30,7 +31,7 @@ __all__ = [
 ]
 
 
-class Shift(bijector.Bijector):
+class Shift(bijector.AutoCompositeTensorBijector):
   """Compute `Y = g(X; shift) = X + shift`.
 
   where `shift` is a numeric `Tensor`.
@@ -92,3 +93,7 @@ class Shift(bijector.Bijector):
     # `log_det_jacobian` need only be specified for a single input, as this will
     # be tiled to match `event_ndims`.
     return tf.zeros([], dtype=dtype_util.base_dtype(x.dtype))
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return {'shift': parameter_properties.ParameterProperties()}

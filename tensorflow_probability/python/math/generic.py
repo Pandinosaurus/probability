@@ -48,6 +48,7 @@ __all__ = [
     'soft_sorting_matrix',
     'soft_threshold',
     'softplus_inverse',
+    'sqrt1pm1',
 ]
 
 
@@ -121,21 +122,59 @@ def log_cumsum_exp(x, axis=-1, name=None):
 
 
 def _kahan_reduction(x, y):
+  """Implements the Kahan summation reduction."""
   (s, c), (s1, c1) = x, y
   for val in -c1, s1:
     u = val - c
     t = s + u
+    # TODO(b/173158845): XLA:CPU reassociates-to-zero the correction term.
     c = (t - s) - u
     s = t
   return s, c
 
 
-_reduce_kahan_sum = variadic_reduce.make_variadic_reduce(_kahan_reduction)
+def _kahan_reduce_bwd(axis, reducer, unsqueezed_shape, aux, grads):
+  operands, inits = aux
+  del axis, inits, reducer  # unused
+  # Return (None, None) for gradients w.r.t. inits
+  return (tf.broadcast_to(tf.reshape(grads[0], unsqueezed_shape),
+                          ps.shape(operands[0])),
+          None), (None, None)
+
+
+def _kahan_reduce_tangents(axis, primals, tangents):
+  del primals  # unused
+  doperands, _ = tangents
+  reduced_tangent = tf.reduce_sum(doperands[0], axis)
+  return (reduced_tangent, tf.zeros_like(reduced_tangent))
+
+
+_reduce_kahan_sum = variadic_reduce.make_variadic_reduce(
+    _kahan_reduction, _kahan_reduce_bwd, _kahan_reduce_tangents)
 
 
 class Kahan(collections.namedtuple('Kahan', ['total', 'correction'])):
   """Result of Kahan summation, i.e. `sum = total - correction`."""
   __slots__ = ()
+
+  def __add__(self, x):
+    return Kahan._make(_kahan_reduction(
+        self, x if isinstance(x, Kahan) else (x, 0)))
+
+  def __radd__(self, x):
+    return Kahan._make(_kahan_reduction(
+        self, x if isinstance(x, Kahan) else (x, 0)))
+
+  def __neg__(self):
+    return Kahan(-self.total, -self.correction)
+
+  def __sub__(self, y):
+    return Kahan._make(_kahan_reduction(
+        self, -y if isinstance(y, Kahan) else (-y, 0)))
+
+  def __rsub__(self, x):
+    return Kahan._make(_kahan_reduction(
+        x if isinstance(x, Kahan) else (x, 0), -self))
 
 
 def reduce_kahan_sum(input_tensor, axis=None, keepdims=False, name=None):
@@ -587,7 +626,7 @@ def log_sub_exp(x, y, return_sign=False, name=None):
 
 
 def log1mexp(x, name=None):
-  """Compute `log(1 - exp(-|x|))` in a numerically stable way.
+  """Compute `log(1 - exp(-|x|))` elementwise in a numerically stable way.
 
   Args:
     x: Float `Tensor`.
@@ -595,7 +634,7 @@ def log1mexp(x, name=None):
       Default value: `None` (i.e., `'log1mexp'`).
 
   Returns:
-    log1mexp: Float `Tensor` of `log1mexp(a)`.
+    log1mexp: Float `Tensor` of `log1mexp(x)`.
 
   #### References
 
@@ -611,6 +650,29 @@ def log1mexp(x, name=None):
         # This switching point is recommended in [1].
         x < np.log(2), tf.math.log(-tf.math.expm1(-x)),
         tf.math.log1p(-tf.math.exp(-x)))
+
+
+def sqrt1pm1(x):
+  """Compute `sqrt(x + 1) - 1` elementwise in a numerically stable way.
+
+  Args:
+    x: Float `Tensor`.
+
+  Returns:
+    sqrt1pm1: Float `Tensor` of `sqrt1pm1(x)`.
+  """
+  # We follow Boost
+  # https://www.boost.org/doc/libs/1_49_0/libs/math/doc/sf_and_dist/html/math_toolkit/special/powers/sqrt1pm1.html
+  # and compute expm1(0.5 * log1p(x)).
+  #
+  # We can also derive an alternative formula by multiplying and
+  # dividing by sqrt(x + 1) + 1:
+  #   sqrt(x + 1) - 1 = (x + 1 - 1) / (sqrt(x + 1) + 1)
+  #                   = x / (sqrt(x + 1) + 1)
+  # The latter form is well-conditioned everywhere, and in particular
+  # does not experience catastrophic cancellation when x ~ 0.  However,
+  # without where-gating, it emits `nan` when x is `+inf`.
+  return tf.math.expm1(0.5 * tf.math.log1p(x))
 
 
 def _log_cosh_impl(x):

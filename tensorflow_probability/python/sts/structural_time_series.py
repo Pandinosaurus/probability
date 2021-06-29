@@ -135,7 +135,8 @@ class StructuralTimeSeries(object):
                              num_timesteps,
                              param_vals,
                              initial_state_prior=None,
-                             initial_step=0):
+                             initial_step=0,
+                             **linear_gaussian_ssm_kwargs):
     """Instantiate this model as a Distribution over specified `num_timesteps`.
 
     Args:
@@ -148,6 +149,8 @@ class StructuralTimeSeries(object):
       initial_step: optional `int` specifying the initial timestep to model.
         This is relevant when the model contains time-varying components,
         e.g., holidays or seasonality.
+      **linear_gaussian_ssm_kwargs: Optional additional keyword arguments to
+        to the base `tfd.LinearGaussianStateSpaceModel` constructor.
 
     Returns:
       dist: a `LinearGaussianStateSpaceModel` Distribution object.
@@ -156,7 +159,8 @@ class StructuralTimeSeries(object):
         num_timesteps=num_timesteps,
         param_map=self._canonicalize_param_vals_as_map(param_vals),
         initial_state_prior=initial_state_prior,
-        initial_step=initial_step)
+        initial_step=initial_step,
+        **linear_gaussian_ssm_kwargs)
 
   def prior_sample(self,
                    num_timesteps,
@@ -181,7 +185,7 @@ class StructuralTimeSeries(object):
         fill with iid samples.
         Default value: `[]` (i.e., draw a single sample and don't expand the
           shape).
-      seed: Python `int` random seed.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
     Returns:
       trajectories: `float` `Tensor` of shape

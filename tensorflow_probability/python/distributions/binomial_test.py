@@ -385,7 +385,7 @@ class BinomialTest(test_util.TestCase):
     self.assertAllClose(
         *self.evaluate([logit(d.prob(1.)), d.logits_parameter()]),
         # Set atol because logit(0.5) == 0.
-        atol=1e-6, rtol=1e-4)
+        atol=3e-6, rtol=1e-4)
     self.assertAllClose(
         *self.evaluate([d.prob(1.), d.probs_parameter()]),
         atol=0, rtol=1e-4)
@@ -472,17 +472,17 @@ class BinomialSamplingTest(test_util.TestCase):
 
   def testSampleXLA(self):
     self.skip_if_no_xla()
-    if not tf.executing_eagerly(): return  # experimental_compile is eager-only.
+    if not tf.executing_eagerly(): return  # jit_compile is eager-only.
     probs = np.random.rand(4, 3).astype(np.float32)
     counts = np.float32([4, 11., 20.])
     dist = tfd.Binomial(total_count=counts, probs=probs, validate_args=True)
     # Verify the compile succeeds going all the way through the distribution.
     self.evaluate(
         tf.function(lambda: dist.sample(5, seed=test_util.test_seed()),
-                    experimental_compile=True)())
+                    jit_compile=True)())
     # Also test the low-level sampler and verify the XLA-friendly variant.
     _, runtime = self.evaluate(
-        tf.function(binomial_lib._random_binomial, experimental_compile=True)(
+        tf.function(binomial_lib._random_binomial, jit_compile=True)(
             shape=tf.constant([], dtype=tf.int32),
             counts=tf.constant(10.), probs=tf.constant(.5),
             seed=test_util.test_seed()))

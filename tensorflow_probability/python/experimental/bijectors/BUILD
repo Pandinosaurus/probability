@@ -35,7 +35,10 @@ multi_substrate_py_library(
     srcs = ["__init__.py"],
     srcs_version = "PY3",
     deps = [
+        ":distribution_bijectors",
+        ":highway_flow",
         ":scalar_function_with_inferred_inverse",
+        ":sharded",
     ],
 )
 
@@ -64,6 +67,99 @@ multi_substrate_py_test(
         # numpy dep,
         # tensorflow dep,
         "//tensorflow_probability",
+        "//tensorflow_probability/python/internal:test_util",
+    ],
+)
+
+multi_substrate_py_library(
+    name = "distribution_bijectors",
+    srcs = ["distribution_bijectors.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":scalar_function_with_inferred_inverse",
+        # numpy dep,
+        # tensorflow dep,
+        "//tensorflow_probability/python/distributions",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "distribution_bijectors_test",
+    size = "medium",
+    srcs = ["distribution_bijectors_test.py"],
+    python_version = "PY3",
+    shard_count = 5,
+    srcs_version = "PY3",
+    deps = [
+        # absl/testing:parameterized dep,
+        # hypothesis dep,
+        # numpy dep,
+        # tensorflow dep,
+        "//tensorflow_probability",
+        "//tensorflow_probability/python/distributions:hypothesis_testlib",
+        "//tensorflow_probability/python/internal:hypothesis_testlib",
+        "//tensorflow_probability/python/internal:tensor_util",
+        "//tensorflow_probability/python/internal:tensorshape_util",
+        "//tensorflow_probability/python/internal:test_util",
+    ],
+)
+
+multi_substrate_py_library(
+    name = "highway_flow",
+    srcs = ["highway_flow.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":scalar_function_with_inferred_inverse",
+        # numpy dep,
+        # tensorflow dep,
+        "//tensorflow_probability/python/bijectors",
+        "//tensorflow_probability/python/internal:samplers",
+        "//tensorflow_probability/python/util",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "highway_flow_test",
+    size = "medium",
+    srcs = ["highway_flow_test.py"],
+    disabled_substrates = ["numpy"],
+    jax_size = "medium",
+    python_version = "PY3",
+    srcs_version = "PY3",
+    deps = [
+        # numpy dep,
+        # tensorflow dep,
+        "//tensorflow_probability",
+        "//tensorflow_probability/python/bijectors:bijector_test_util",
+        "//tensorflow_probability/python/internal:test_util",
+    ],
+)
+
+multi_substrate_py_library(
+    name = "sharded",
+    srcs = ["sharded.py"],
+    deps = [
+        # tensorflow dep,
+        "//tensorflow_probability/python/distributions:distribution",
+        "//tensorflow_probability/python/distributions:log_prob_ratio",
+        "//tensorflow_probability/python/internal:distribute_lib",
+        "//tensorflow_probability/python/internal:samplers",
+    ],
+)
+
+multi_substrate_py_test(
+    name = "sharded_test",
+    size = "medium",
+    srcs = ["sharded_test.py"],
+    disabled_substrates = ["numpy"],
+    python_version = "PY3",
+    deps = [
+        ":sharded",
+        # tensorflow dep,
+        "//tensorflow_probability",
+        "//tensorflow_probability/python/internal:distribute_lib",
+        "//tensorflow_probability/python/internal:distribute_test_lib",
+        "//tensorflow_probability/python/internal:samplers",
         "//tensorflow_probability/python/internal:test_util",
     ],
 )

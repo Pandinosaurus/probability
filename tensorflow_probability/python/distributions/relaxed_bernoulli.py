@@ -32,7 +32,7 @@ from tensorflow_probability.python.internal import reparameterization
 from tensorflow_probability.python.internal import tensor_util
 
 
-class RelaxedBernoulli(distribution.Distribution):
+class RelaxedBernoulli(distribution.AutoCompositeTensorDistribution):
   """RelaxedBernoulli distribution with temperature and logits parameters.
 
   The RelaxedBernoulli is a distribution over the unit interval (0,1), which
@@ -234,7 +234,7 @@ class RelaxedBernoulli(distribution.Distribution):
     if self._logits is None:
       probs = tf.convert_to_tensor(self._probs)
       return tf.math.log(probs) - tf.math.log1p(-probs)
-    return tf.identity(self._logits)
+    return tensor_util.identity_as_tensor(self._logits)
 
   def probs_parameter(self, name=None):
     """Probs computed from non-`None` input arg (`probs` or `logits`)."""
@@ -243,7 +243,7 @@ class RelaxedBernoulli(distribution.Distribution):
 
   def _probs_parameter_no_checks(self):
     if self._logits is None:
-      return tf.identity(self._probs)
+      return tensor_util.identity_as_tensor(self._probs)
     return tf.math.sigmoid(self._logits)
 
   def _event_shape_tensor(self):
@@ -251,14 +251,6 @@ class RelaxedBernoulli(distribution.Distribution):
 
   def _event_shape(self):
     return tf.TensorShape([])
-
-  def _batch_shape_tensor(self):
-    return self._transformed_logistic().batch_shape_tensor()
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(
-        (self._logits if self._probs is None else self._probs).shape,
-        self._temperature.shape)
 
   def _sample_n(self, n, seed=None, **kwargs):
     return self._transformed_logistic().sample(n, seed=seed, **kwargs)
@@ -302,10 +294,38 @@ class RelaxedBernoulli(distribution.Distribution):
     return self._transformed_logistic().log_survival_function(y, **kwargs)
 
   def _cdf(self, y, **kwargs):
-    return self._transformed_logistic().cdf(y, **kwargs)
+    return tf.math.exp(self._log_cdf(y, **kwargs))
 
   def _log_cdf(self, y, **kwargs):
-    return self._transformed_logistic().log_cdf(y, **kwargs)
+    logits_y = tf.math.log(y) - tf.math.log1p(-y)
+    logistic_scale = tf.math.reciprocal(self._temperature)
+    logits_parameter = self._logits_parameter_no_checks()
+
+    inf_logits_same_sign = (
+        tf.math.is_inf(logits_y / logistic_scale) &
+        tf.math.is_inf(logits_parameter) &
+        (tf.math.equal(tf.math.sign(logits_y / logistic_scale),
+                       tf.math.sign(logits_parameter))))
+
+    numpy_dtype = dtype_util.as_numpy_dtype(self.dtype)
+
+    safe_logits_y = tf.where(inf_logits_same_sign, numpy_dtype(0.), logits_y)
+    safe_logistic_scale = tf.where(
+        inf_logits_same_sign, numpy_dtype(1.), logistic_scale)
+
+    # Handle the case when both logit parameters are infinite and opposite
+    # signs.
+    # When logits_parameter = +inf and logits_y = -inf, this results in
+    # probability 0.
+    # When logits_parameter = -inf and logits_y = +inf, this results in
+    # probability 1.
+    numpy_dtype = dtype_util.as_numpy_dtype(self.dtype)
+
+    return tf.where(
+        inf_logits_same_sign,
+        numpy_dtype(0.),
+        -tf.math.softplus(
+            -(safe_logits_y  / safe_logistic_scale - logits_parameter)))
 
   def _default_event_space_bijector(self):
     # TODO(b/145620027) Finalize choice of bijector.

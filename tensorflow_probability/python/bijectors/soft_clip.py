@@ -32,6 +32,7 @@ from tensorflow_probability.python.bijectors import softplus
 
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import tensor_util
 
 
@@ -40,7 +41,7 @@ __all__ = [
 ]
 
 
-class SoftClip(bijector.Bijector):
+class SoftClip(bijector.AutoCompositeTensorBijector):
   """Bijector that approximates clipping as a continuous, differentiable map.
 
   The `forward` method takes unconstrained scalar `x` to a value `y` in
@@ -267,6 +268,17 @@ class SoftClip(bijector.Bijector):
         parameters=parameters,
         is_constant_jacobian=not components,
         name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict(
+        low=parameter_properties.ParameterProperties(),
+        high=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=parameter_properties
+            .BIJECTOR_NOT_IMPLEMENTED),
+        hinge_softness=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=(
+                lambda: softplus.Softplus(low=dtype_util.eps(dtype)))))
 
   @property
   def low(self):

@@ -33,7 +33,7 @@ from tensorflow_probability.python.internal import special_math
 from tensorflow_probability.python.internal import tensor_util
 
 
-class ProbitBernoulli(distribution.Distribution):
+class ProbitBernoulli(distribution.AutoCompositeTensorDistribution):
   """ProbitBernoulli distribution.
 
   The ProbitBernoulli distribution with `probs` parameter, i.e., the probability
@@ -119,14 +119,6 @@ class ProbitBernoulli(distribution.Distribution):
     """Input argument `probs`."""
     return self._probs
 
-  def _batch_shape_tensor(self):
-    x = self._probs if self._probits is None else self._probits
-    return ps.shape(x)
-
-  def _batch_shape(self):
-    x = self._probs if self._probits is None else self._probits
-    return x.shape
-
   def _event_shape_tensor(self):
     return tf.constant([], dtype=tf.int32)
 
@@ -143,7 +135,8 @@ class ProbitBernoulli(distribution.Distribution):
   def _log_prob(self, event):
     log_probs0, log_probs1 = self._outcome_log_probs()
     event = tf.cast(event, log_probs0.dtype)
-    return event * (log_probs1 - log_probs0) + log_probs0
+    return (tf.math.multiply_no_nan(log_probs0, 1 - event) +
+            tf.math.multiply_no_nan(log_probs1, event))
 
   def _outcome_log_probs(self):
     if self._probits is None:
@@ -177,7 +170,7 @@ class ProbitBernoulli(distribution.Distribution):
     if self._probits is None:
       probs = tf.convert_to_tensor(self._probs)
       return tf.math.ndtri(probs)
-    return tf.identity(self._probits)
+    return tensor_util.identity_as_tensor(self._probits)
 
   def probs_parameter(self, name=None):
     """Probs computed from non-`None` input arg (`probs` or `probits`)."""
@@ -186,7 +179,7 @@ class ProbitBernoulli(distribution.Distribution):
 
   def _probs_parameter_no_checks(self):
     if self._probits is None:
-      return tf.identity(self._probs)
+      return tensor_util.identity_as_tensor(self._probs)
     return special_math.ndtr(self._probits)
 
   def _default_event_space_bijector(self):

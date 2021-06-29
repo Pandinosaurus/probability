@@ -24,15 +24,16 @@ import functools
 import numpy as np
 
 # pylint: disable=unused-import
+from tensorflow_probability.python.internal.backend.numpy import __internal__
 from tensorflow_probability.python.internal.backend.numpy import _utils as utils
 from tensorflow_probability.python.internal.backend.numpy import bitwise
 from tensorflow_probability.python.internal.backend.numpy import config
 from tensorflow_probability.python.internal.backend.numpy import debugging
 from tensorflow_probability.python.internal.backend.numpy import errors
-from tensorflow_probability.python.internal.backend.numpy import keras
 from tensorflow_probability.python.internal.backend.numpy import linalg
 from tensorflow_probability.python.internal.backend.numpy import nest
 from tensorflow_probability.python.internal.backend.numpy import nn
+from tensorflow_probability.python.internal.backend.numpy import numpy_keras as keras
 from tensorflow_probability.python.internal.backend.numpy import numpy_logging as logging
 from tensorflow_probability.python.internal.backend.numpy import numpy_math as math
 from tensorflow_probability.python.internal.backend.numpy import numpy_signal as signal
@@ -50,6 +51,9 @@ from tensorflow_probability.python.internal.backend.numpy.numpy_array import *  
 from tensorflow_probability.python.internal.backend.numpy.numpy_math import *  # pylint: disable=wildcard-import
 from tensorflow_probability.python.internal.backend.numpy.ops import *  # pylint: disable=wildcard-import
 from tensorflow_probability.python.internal.backend.numpy.tensor_array_ops import TensorArray
+from tensorflow_probability.python.internal.backend.numpy.tensor_spec import TensorSpec
+from tensorflow_probability.python.internal.backend.numpy.type_spec import BatchableTypeSpec
+from tensorflow_probability.python.internal.backend.numpy.type_spec import TypeSpec
 # pylint: enable=unused-import
 
 
@@ -61,17 +65,18 @@ Assert = debugging.Assert
 
 def _function(func=None, input_signature=None, autograph=True,  # pylint: disable=unused-argument
               experimental_autograph_options=None,  # pylint: disable=unused-argument
-              experimental_relax_shapes=False, experimental_compile=None):  # pylint: disable=unused-argument
+              experimental_relax_shapes=False, jit_compile=None):  # pylint: disable=unused-argument
   """Like `tf.function`, for JAX."""
   transform = lambda fn: fn
-  if experimental_compile:
+  if jit_compile:
     if JAX_MODE:
       from jax import jit  # pylint: disable=g-import-not-at-top
 
       def non_jittable(arg):
         # Use static args for callables and for bools, which will sometimes
         # be used in a `if` block and fail if they are tracers.
-        return callable(arg) or np.asarray(arg).dtype == np.bool
+        return (arg is not None and
+                (callable(arg) or np.asarray(arg).dtype == np.bool_))
 
       def jit_decorator(f):
         cache = {}
@@ -118,11 +123,30 @@ def _function(func=None, input_signature=None, autograph=True,  # pylint: disabl
   return transform
 
 
+class _SingleReplicaContext(object):
+  """Dummy replica context for numpy."""
+
+  @property
+  def replica_id_in_sync_group(self):
+    if JAX_MODE:
+      raise NotImplementedError
+    return 0
+
+  @property
+  def num_replicas_in_sync(self):
+    if JAX_MODE:
+      raise NotImplementedError
+    return 1
+
+
 # --- Begin Public Functions --------------------------------------------------
 
 
 compat = collections.namedtuple('compat', 'dimension_value')(
     lambda dim: None if dim is None else int(dim))
+
+distribute = collections.namedtuple('distribute', 'get_replica_context')(
+    _SingleReplicaContext)
 
 function = utils.copy_docstring(
     'tf.function',

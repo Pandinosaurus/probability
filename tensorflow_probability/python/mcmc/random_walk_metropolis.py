@@ -23,9 +23,11 @@ import collections
 
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python.internal import distribute_lib
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import samplers
+from tensorflow_probability.python.internal import tensorshape_util
 from tensorflow_probability.python.mcmc import kernel as kernel_base
 from tensorflow_probability.python.mcmc import metropolis_hastings
 from tensorflow_probability.python.mcmc.internal import util as mcmc_util
@@ -78,15 +80,15 @@ def random_walk_normal_fn(scale=1., name=None):
       callable returns the same-type `list` of `Tensor`s as the input and
       represents the proposal for the RWM algorithm.
   """
-  def _fn(state_parts, seed):
+  def _fn(state_parts, seed, experimental_shard_axis_names=None):
     """Adds a normal perturbation to the input state.
 
     Args:
       state_parts: A list of `Tensor`s of any shape and real dtype representing
         the state parts of the `current_state` of the Markov chain.
-      seed: `int` or None. The random seed for this `Op`. If `None`, no seed is
-        applied.
-        Default value: `None`.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
+      experimental_shard_axis_names: A structure of string names indicating how
+        members of the state are sharded.
 
     Returns:
       perturbed_state_parts: A Python `list` of The `Tensor`s. Has the same
@@ -103,6 +105,9 @@ def random_walk_normal_fn(scale=1., name=None):
         raise ValueError('`scale` must broadcast with `state_parts`.')
 
       part_seeds = samplers.split_seed(seed, n=len(state_parts))
+      part_seeds = distribute_lib.fold_in_axis_index(
+          part_seeds, experimental_shard_axis_names)
+
       next_state_parts = [
           samplers.normal(  # pylint: disable=g-complex-comprehension
               mean=state_part,
@@ -141,15 +146,15 @@ def random_walk_uniform_fn(scale=1., name=None):
       returns the same-type `list` of `Tensor`s as the input and represents the
       proposal for the RWM algorithm.
   """
-  def _fn(state_parts, seed):
+  def _fn(state_parts, seed, experimental_shard_axis_names=None):
     """Adds a uniform perturbation to the input state.
 
     Args:
       state_parts: A list of `Tensor`s of any shape and real dtype representing
         the state parts of the `current_state` of the Markov chain.
-      seed: `int` or None. The random seed for this `Op`. If `None`, no seed is
-        applied.
-        Default value: `None`.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
+      experimental_shard_axis_names: A structure of string names indicating how
+        members of the state are sharded.
 
     Returns:
       perturbed_state_parts: A Python `list` of The `Tensor`s. Has the same
@@ -164,7 +169,11 @@ def random_walk_uniform_fn(scale=1., name=None):
         scales *= len(state_parts)
       if len(state_parts) != len(scales):
         raise ValueError('`scale` must broadcast with `state_parts`.')
-      part_seeds = samplers.split_seed(seed, n=len(state_parts))
+
+      part_seeds = list(samplers.split_seed(seed, n=len(state_parts)))
+      part_seeds = distribute_lib.fold_in_axis_index(
+          part_seeds, experimental_shard_axis_names)
+
       next_state_parts = [
           samplers.uniform(  # pylint: disable=g-complex-comprehension
               minval=state_part - scale_part,
@@ -187,7 +196,7 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
   `proposal_state = current_state + perturb` by a random
   perturbation, followed by Metropolis-Hastings accept/reject step. For more
   details see [Section 2.1 of Roberts and Rosenthal (2004)](
-  http://emis.ams.org/journals/PS/images/getdoc510c.pdf?id=35&article=15&mode=pdf).
+  http://dx.doi.org/10.1214/154957804100000024).
 
   Current class implements RWM for normal and uniform proposals. Alternatively,
   the user can supply any custom proposal generating function.
@@ -210,8 +219,6 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
   import numpy as np
   import tensorflow.compat.v2 as tf
   import tensorflow_probability as tfp
-  tf.enable_v2_behavior()
-
   tfd = tfp.distributions
 
   dtype = np.float32
@@ -242,8 +249,6 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
   import numpy as np
   import tensorflow.compat.v2 as tf
   import tensorflow_probability as tfp
-  tf.enable_v2_behavior()
-
   tfd = tfp.distributions
 
   dtype = np.float32
@@ -293,8 +298,6 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
   import numpy as np
   import tensorflow.compat.v2 as tf
   import tensorflow_probability as tfp
-  tf.enable_v2_behavior()
-
   tfd = tfp.distributions
 
   dtype = np.float32
@@ -340,6 +343,7 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
   def __init__(self,
                target_log_prob_fn,
                new_state_fn=None,
+               experimental_shard_axis_names=None,
                name=None):
     """Initializes this transition kernel.
 
@@ -353,6 +357,8 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
         a symmetric distribution centered at the input state part.
         Default value: `None` which is mapped to
           `tfp.mcmc.random_walk_normal_fn()`.
+      experimental_shard_axis_names: A structure of string names indicating how
+        members of the state are sharded.
       name: Python `str` name prefixed to Ops created by this function.
         Default value: `None` (i.e., 'rwm_kernel').
 
@@ -374,7 +380,9 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
         inner_kernel=UncalibratedRandomWalk(
             target_log_prob_fn=target_log_prob_fn,
             new_state_fn=new_state_fn,
-            name=name))
+            name=name)).experimental_with_shard_axes(
+                experimental_shard_axis_names)
+    self._parameters = self._impl.inner_kernel.parameters.copy()
 
   @property
   def target_log_prob_fn(self):
@@ -407,7 +415,7 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
       previous_kernel_results: `collections.namedtuple` containing `Tensor`s
         representing values from previous calls to this function (or from the
         `bootstrap_results` function.)
-      seed: Optional, a seed for reproducible sampling.
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
 
     Returns:
       next_state: Tensor or Python list of `Tensor`s representing the state(s)
@@ -427,6 +435,13 @@ class RandomWalkMetropolis(kernel_base.TransitionKernel):
     """Creates initial `previous_kernel_results` using a supplied `state`."""
     return self._impl.bootstrap_results(init_state)
 
+  @property
+  def experimental_shard_axis_names(self):
+    return self._parameters['experimental_shard_axis_names']
+
+  def experimental_with_shard_axes(self, shard_axes):
+    return self.copy(experimental_shard_axis_names=shard_axes)
+
 
 class UncalibratedRandomWalk(kernel_base.TransitionKernel):
   """Generate proposal for the Random Walk Metropolis algorithm.
@@ -444,6 +459,7 @@ class UncalibratedRandomWalk(kernel_base.TransitionKernel):
   def __init__(self,
                target_log_prob_fn,
                new_state_fn=None,
+               experimental_shard_axis_names=None,
                name=None):
     if new_state_fn is None:
       new_state_fn = random_walk_normal_fn()
@@ -453,6 +469,7 @@ class UncalibratedRandomWalk(kernel_base.TransitionKernel):
     self._parameters = dict(
         target_log_prob_fn=target_log_prob_fn,
         new_state_fn=new_state_fn,
+        experimental_shard_axis_names=experimental_shard_axis_names,
         name=name)
 
   @property
@@ -490,7 +507,19 @@ class UncalibratedRandomWalk(kernel_base.TransitionKernel):
         ]
 
       seed = samplers.sanitize_seed(seed)  # Retain for diagnostics.
-      next_state_parts = self.new_state_fn(current_state_parts, seed)  # pylint: disable=not-callable
+      state_fn_kwargs = {}
+      if self.experimental_shard_axis_names is not None:
+        state_fn_kwargs['experimental_shard_axis_names'] = (
+            self.experimental_shard_axis_names)
+
+      next_state_parts = self.new_state_fn(  # pylint: disable=not-callable
+          current_state_parts, seed, **state_fn_kwargs)
+
+      # User should be using a new_state_fn that does not alter the state size.
+      # This will fail noisily if that is not the case.
+      for next_part, current_part in zip(next_state_parts, current_state_parts):
+        tensorshape_util.set_shape(next_part, current_part.shape)
+
       # Compute `target_log_prob` so its available to MetropolisHastings.
       next_target_log_prob = self.target_log_prob_fn(*next_state_parts)  # pylint: disable=not-callable
 
@@ -519,6 +548,13 @@ class UncalibratedRandomWalk(kernel_base.TransitionKernel):
           target_log_prob=init_target_log_prob,
           # Allow room for one_step's seed.
           seed=samplers.zeros_seed())
+
+  @property
+  def experimental_shard_axis_names(self):
+    return self._parameters['experimental_shard_axis_names']
+
+  def experimental_with_shard_axes(self, shard_axis_names):
+    return self.copy(experimental_shard_axis_names=shard_axis_names)
 
 
 def _maybe_call_fn(fn,

@@ -45,7 +45,6 @@ multi_substrate_py_library(
         ":absolute_value",
         ":affine",
         ":affine_linear_operator",
-        ":affine_scalar",
         ":ascending",
         ":batch_normalization",
         ":bijector",
@@ -120,19 +119,21 @@ multi_substrate_py_library(
         "bijector.py",
         "chain.py",
         "composition.py",
+        "ldj_ratio.py",
     ],
     deps = [
         # numpy dep,
-        # six dep,
         # tensorflow dep,
-        "//tensorflow_probability/python/distributions:distribution",
-        "//tensorflow_probability/python/distributions:transformed_distribution",
         "//tensorflow_probability/python/internal:assert_util",
+        "//tensorflow_probability/python/internal:auto_composite_tensor",
+        "//tensorflow_probability/python/internal:batch_shape_lib",
         "//tensorflow_probability/python/internal:cache_util",
+        "//tensorflow_probability/python/internal:docstring_util",
         "//tensorflow_probability/python/internal:dtype_util",
         "//tensorflow_probability/python/internal:name_util",
         "//tensorflow_probability/python/internal:nest_util",
         "//tensorflow_probability/python/internal:tensorshape_util",
+        "//tensorflow_probability/python/math:generic",
         "//tensorflow_probability/python/math:gradient",
     ],
 )
@@ -183,19 +184,6 @@ multi_substrate_py_library(
 )
 
 multi_substrate_py_library(
-    name = "affine_scalar",
-    srcs = ["affine_scalar.py"],
-    deps = [
-        ":bijector",
-        # tensorflow dep,
-        "//tensorflow_probability/python/internal:assert_util",
-        "//tensorflow_probability/python/internal:distribution_util",
-        "//tensorflow_probability/python/internal:dtype_util",
-        "//tensorflow_probability/python/internal:tensor_util",
-    ],
-)
-
-multi_substrate_py_library(
     name = "affine",
     srcs = ["affine.py"],
     deps = [
@@ -214,6 +202,7 @@ multi_substrate_py_library(
         ":bijector",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -225,6 +214,7 @@ multi_substrate_py_library(
         ":bijector",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -234,9 +224,11 @@ multi_substrate_py_library(
     srcs = ["shifted_gompertz_cdf.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/math",
     ],
@@ -249,6 +241,7 @@ multi_substrate_py_library(
         ":bijector",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:prefer_static",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/internal:tensorshape_util",
@@ -259,10 +252,12 @@ multi_substrate_py_library(
     name = "scale_matvec_diag",
     srcs = ["scale_matvec_diag.py"],
     deps = [
-        ":bijector",
+        ":scale_matvec_linear_operator",
         # tensorflow dep,
-        "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
+        "//tensorflow_probability/python/internal:prefer_static",
+        "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
 
@@ -270,10 +265,13 @@ multi_substrate_py_library(
     name = "scale_matvec_tril",
     srcs = ["scale_matvec_tril.py"],
     deps = [
-        ":bijector",
+        ":fill_triangular",
+        ":scale_matvec_linear_operator",
         # tensorflow dep,
-        "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
+        "//tensorflow_probability/python/internal:prefer_static",
+        "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
 
@@ -290,7 +288,6 @@ multi_substrate_py_library(
     name = "blockwise",
     srcs = ["blockwise.py"],
     deps = [
-        ":bijector",
         # numpy dep,
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
@@ -307,6 +304,7 @@ multi_substrate_py_library(
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/internal:tensorshape_util",
     ],
@@ -321,6 +319,7 @@ multi_substrate_py_library(
         "//tensorflow_probability/python/internal:distribution_util",
         "//tensorflow_probability/python/internal:dtype_util",
         "//tensorflow_probability/python/internal:nest_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensorshape_util",
     ],
 )
@@ -448,9 +447,11 @@ multi_substrate_py_library(
     srcs = ["frechet_cdf.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -466,6 +467,7 @@ multi_substrate_py_library(
         ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -496,9 +498,11 @@ multi_substrate_py_library(
     srcs = ["gumbel_cdf.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -508,9 +512,11 @@ multi_substrate_py_library(
     srcs = ["gev_cdf.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -520,9 +526,11 @@ multi_substrate_py_library(
     srcs = ["gompertz_cdf.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -559,10 +567,12 @@ multi_substrate_py_library(
     deps = [
         ":bijector",
         ":invert",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:distribution_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -614,10 +624,12 @@ multi_substrate_py_library(
     srcs = ["moyal_cdf.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # numpy dep,
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -629,6 +641,7 @@ multi_substrate_py_library(
         ":bijector",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:prefer_static",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/math:linalg",
@@ -678,6 +691,7 @@ multi_substrate_py_library(
         # numpy dep,
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:prefer_static",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/internal:tensorshape_util",
@@ -694,6 +708,7 @@ multi_substrate_py_library(
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:distribution_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensorshape_util",
     ],
 )
@@ -705,6 +720,7 @@ multi_substrate_py_library(
         ":bijector",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -725,9 +741,11 @@ multi_substrate_py_library(
     srcs_version = "PY3",
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/internal:tensorshape_util",
         "//tensorflow_probability/python/util",
@@ -739,8 +757,10 @@ multi_substrate_py_library(
     srcs = ["rayleigh_cdf.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -749,7 +769,6 @@ multi_substrate_py_library(
     name = "real_nvp",
     srcs = ["real_nvp.py"],
     deps = [
-        ":affine_scalar",
         ":bijector",
         # numpy dep,
         # tensorflow dep,
@@ -778,6 +797,7 @@ multi_substrate_py_library(
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
         "//tensorflow_probability/python/internal:nest_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:prefer_static",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/internal:tensorshape_util",
@@ -789,8 +809,10 @@ multi_substrate_py_library(
     srcs = ["restructure.py"],
     deps = [
         ":bijector",
+        ":invert",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:nest_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:prefer_static",
     ],
 )
@@ -799,7 +821,6 @@ multi_substrate_py_library(
     name = "fill_scale_tril",
     srcs = ["fill_scale_tril.py"],
     deps = [
-        ":affine_scalar",
         ":chain",
         ":fill_triangular",
         ":softplus",
@@ -817,6 +838,7 @@ multi_substrate_py_library(
         ":bijector",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -836,11 +858,13 @@ multi_substrate_py_library(
     srcs = ["sinh_arcsinh.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # absl/testing:parameterized dep,
         # numpy dep,
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/math",
     ],
@@ -854,6 +878,7 @@ multi_substrate_py_library(
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/math",
     ],
@@ -864,9 +889,11 @@ multi_substrate_py_library(
     srcs = ["softfloor.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/math",
     ],
 )
@@ -894,7 +921,8 @@ multi_substrate_py_library(
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:distribution_util",
         "//tensorflow_probability/python/internal:dtype_util",
-        "//tensorflow_probability/python/math",
+        "//tensorflow_probability/python/internal:parameter_properties",
+        "//tensorflow_probability/python/math:generic",
     ],
 )
 
@@ -915,9 +943,11 @@ multi_substrate_py_library(
     srcs = ["split.py"],
     deps = [
         ":bijector",
+        ":invert",
         # numpy dep,
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:prefer_static",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/internal:tensorshape_util",
@@ -977,6 +1007,7 @@ multi_substrate_py_library(
         "//tensorflow_probability/python/internal:assert_util",
         "//tensorflow_probability/python/internal:distribution_util",
         "//tensorflow_probability/python/internal:dtype_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensorshape_util",
     ],
 )
@@ -986,8 +1017,10 @@ multi_substrate_py_library(
     srcs = ["weibull_cdf.py"],
     deps = [
         ":bijector",
+        ":softplus",
         # tensorflow dep,
         "//tensorflow_probability/python/internal:assert_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
     ],
 )
@@ -1033,7 +1066,10 @@ multi_substrate_py_test(
         # mock dep,
         # numpy dep,
         # tensorflow dep,
+        "//tensorflow_probability",
+        "//tensorflow_probability/python/distributions",
         "//tensorflow_probability/python/internal:cache_util",
+        "//tensorflow_probability/python/internal:parameter_properties",
         "//tensorflow_probability/python/internal:tensor_util",
         "//tensorflow_probability/python/internal:test_util",
     ],
@@ -1086,19 +1122,6 @@ multi_substrate_py_test(
         ":bijectors",
         # numpy dep,
         # tensorflow dep,
-        "//tensorflow_probability/python/internal:test_util",
-    ],
-)
-
-multi_substrate_py_test(
-    name = "affine_scalar_test",
-    size = "small",
-    srcs = ["affine_scalar_test.py"],
-    deps = [
-        ":bijector_test_util",
-        # numpy dep,
-        # tensorflow dep,
-        "//tensorflow_probability",
         "//tensorflow_probability/python/internal:test_util",
     ],
 )
@@ -1410,6 +1433,7 @@ multi_substrate_py_test(
         ":bijectors",
         # numpy dep,
         # tensorflow dep,
+        "//tensorflow_probability/python/distributions",
         "//tensorflow_probability/python/internal:test_util",
     ],
 )
@@ -1523,6 +1547,18 @@ multi_substrate_py_test(
 )
 
 multi_substrate_py_test(
+    name = "ldj_ratio_test",
+    size = "small",
+    srcs = ["ldj_ratio_test.py"],
+    deps = [
+        # numpy dep,
+        # tensorflow dep,
+        "//tensorflow_probability",
+        "//tensorflow_probability/python/internal:test_util",
+    ],
+)
+
+multi_substrate_py_test(
     name = "lambertw_transform_test",
     size = "small",
     srcs = ["lambertw_transform_test.py"],
@@ -1533,6 +1569,7 @@ multi_substrate_py_test(
         # absl/testing:parameterized dep,
         # numpy dep,
         # tensorflow dep,
+        "//tensorflow_probability/python/distributions",
         "//tensorflow_probability/python/internal:test_util",
     ],
 )
@@ -1773,6 +1810,7 @@ multi_substrate_py_test(
         ":bijector_test_util",
         ":bijectors",
         # tensorflow dep,
+        "//tensorflow_probability/python/distributions",
         "//tensorflow_probability/python/internal:test_util",
     ],
 )
@@ -1837,7 +1875,6 @@ multi_substrate_py_test(
     name = "soft_clip_test",
     size = "small",
     srcs = ["soft_clip_test.py"],
-    numpy_tags = ["notap"],  # TODO(b/149350565): remove this.
     deps = [
         ":bijectors",
         # numpy dep,

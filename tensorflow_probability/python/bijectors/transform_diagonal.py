@@ -26,7 +26,7 @@ __all__ = [
 ]
 
 
-class TransformDiagonal(bijector.Bijector):
+class TransformDiagonal(bijector.AutoCompositeTensorBijector):
   """Applies a Bijector to the diagonal of a matrix.
 
   #### Example
@@ -65,6 +65,10 @@ class TransformDiagonal(bijector.Bijector):
           dtype=diag_bijector.dtype,
           parameters=parameters,
           name=name)
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict()
 
   @property
   def diag_bijector(self):

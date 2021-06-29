@@ -17,19 +17,19 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import functools
-
 import numpy as np
 import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python import math as tfp_math
 from tensorflow_probability.python.bijectors import identity as identity_bijector
+from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.distributions import chi2 as chi2_lib
 from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import mvn_linear_operator
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import distribution_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import reparameterization
 from tensorflow_probability.python.internal import samplers
 from tensorflow_probability.python.internal import tensor_util
@@ -39,7 +39,8 @@ __all__ = [
 ]
 
 
-class MultivariateStudentTLinearOperator(distribution.Distribution):
+class MultivariateStudentTLinearOperator(
+    distribution.AutoCompositeTensorDistribution):
   """The [Multivariate Student's t-distribution](
 
   https://en.wikipedia.org/wiki/Multivariate_t-distribution) on `R^k`.
@@ -98,13 +99,13 @@ class MultivariateStudentTLinearOperator(distribution.Distribution):
   # Covariance is closely related to the sigma matrix (for df=3, it is 3x of the
   # sigma matrix).
 
-  mvt.covariance().eval()
+  mvt.covariance()
   # ==> [[ 1.08,  0.36,  0.18],
   #      [ 0.36,  0.87, -0.39],
   #      [ 0.18, -0.39,  0.78]]
 
   # Compute the pdf of an`R^3` observation; return a scalar.
-  mvt.prob([-1., 0, 1]).eval()  # shape: []
+  mvt.prob([-1., 0, 1])  # shape: []
 
   """
 
@@ -214,17 +215,15 @@ class MultivariateStudentTLinearOperator(distribution.Distribution):
     """
     return self._df
 
-  def _batch_shape_tensor(self):
-    shape_list = [
-        self.scale.batch_shape_tensor(),
-        tf.shape(self.df),
-        tf.shape(self.loc)[:-1]
-    ]
-    return functools.reduce(tf.broadcast_dynamic_shape, shape_list)
-
-  def _batch_shape(self):
-    shape_list = [self.scale.batch_shape, self.df.shape, self.loc.shape[:-1]]
-    return functools.reduce(tf.broadcast_static_shape, shape_list)
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    return dict(
+        df=parameter_properties.ParameterProperties(
+            default_constraining_bijector_fn=(
+                lambda: softplus_bijector.Softplus(low=dtype_util.eps(dtype)))
+            ),
+        loc=parameter_properties.ParameterProperties(event_ndims=1),
+        scale=parameter_properties.BatchedComponentProperties())
 
   def _event_shape_tensor(self):
     return self.scale.range_dimension_tensor()[tf.newaxis]

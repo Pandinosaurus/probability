@@ -18,22 +18,29 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import abc
+import collections
+import functools
 import sys
 
+import tensorflow.compat.v1 as tf1
 import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python.bijectors import bijector
+from tensorflow_probability.python.bijectors import ldj_ratio as ldj_ratio_lib
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import nest_util
 from tensorflow_probability.python.internal import prefer_static as ps
+from tensorflow.python.ops import control_flow_util  # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.util import nest  # pylint: disable=g-direct-tensorflow-import
 
 
 __all__ = [
     'Composition',
 ]
+
+
+JAX_MODE = False
 
 
 def pack_structs_like(template, *structures):
@@ -68,6 +75,15 @@ def _max_precision_sum(a, b):
   return a + b
 
 
+MinEventNdimsInferenceDownstreamQuantities = collections.namedtuple(
+    'MinEventNdimsInferenceDownstreamQuantities',
+    ['forward_min_event_ndims', 'parts_interact'])
+
+BijectorWithMetadata = collections.namedtuple(
+    'BijectorWithMetadata',
+    ['bijector', 'x', 'x_event_ndims', 'kwargs', 'assertions'])
+
+
 class Composition(bijector.Bijector):
   """Base class for Composition bijectors (Chain, JointMap).
 
@@ -93,27 +109,42 @@ class Composition(bijector.Bijector):
 
   def __init__(self,
                bijectors,
-               forward_min_event_ndims,
-               inverse_min_event_ndims,
                name,
                parameters,
+               forward_min_event_ndims=None,
+               inverse_min_event_ndims=None,
                validate_event_size=False,
                **kwargs):
     """Instantiates a Composition of bijectors.
 
     Args:
-      bijectors: A nest-compatible structure of bijector instances.
-      forward_min_event_ndims: A (structure of) integer describing both the
-        multi-part structure of inputs to `forward` and the _aligned_ mininimum
-        valid event-ndims. Compositions that allow different relative ranks
-        should pass structures of `None`.
-      inverse_min_event_ndims: A (structure of) integer describing both the
-        multi-part structure of inputs to `inverse` and the _aligned_ mininimum
-        valid event-ndims. Compositions that allow different relative ranks
-        should pass structures of `None`.
+      bijectors: A nest-compatible structure of bijector instances or a
+        `Composition` bijector. If `bijectors` is a nested structure, then
+        `_walk_forward` and `_walk_inverse` must be implemented. If `bijectors`
+        is a `Composition` bijector, `_walk_forward` and `_walk_inverse` call
+        its corresponding methods.
       name: Name of this bijector.
       parameters: Dictionary of parameters used to initialize this bijector.
         These must be the exact values passed to `__init__`.
+      forward_min_event_ndims: A (structure of) integers or `None` values.
+        If all values are integers, then these specify the mininimum rank of
+        each event part; their structure must match that of inputs to `forward`.
+        If the minimum ranks are not known, inference may be triggered by
+        passing a structure of `None` values instead. This structure must be
+        such that calling `self._walk_forward(step_fn, forward_min_event_ndims)`
+        passes exactly one `None` value to each toplevel invocation of
+        `step_fn`---that is, it should correspond to the structure of
+        *bijectors* that act directly on a user-passed input (excluding
+        bijectors that act on downstream quantities), which may in general be
+        shallower than the structure of inputs to `forward`. For example, the
+        first step of a Chain applies a single bijector, so Chain would pass a
+        single `None` (even though the initial bijector might itself accept a
+        multipart input). On the other hand, the bijectors in a JointMap are
+        all applied directly to user-passed input, so the
+        appropriate structure would be that of `self.bijectors` (even if some
+        of those bijectors might themselves accept multipart inputs).
+      inverse_min_event_ndims: A (structure of) integers and/or `None` values,
+        with semantics analogous to `forward_min_event_ndims`.
       validate_event_size: Checks that bijectors are not applied to inputs with
         incomplete support. For example, the following LDJ would be incorrect:
         `Chain([Scale(), SoftmaxCentered()]).forward_log_det_jacobian([1], [1])`
@@ -128,9 +159,34 @@ class Composition(bijector.Bijector):
     with tf.name_scope(name):
       is_constant_jacobian = True
       is_injective = True
+      is_permutation = True
       for bij in nest.flatten(bijectors):
         is_injective &= bij._is_injective
         is_constant_jacobian &= bij.is_constant_jacobian
+        is_permutation &= bij._is_permutation
+
+      # Copy the nested structure so we don't mutate arguments during tracking.
+      self._bijectors = nest.map_structure(lambda b: b, bijectors)
+      self._validate_event_size = validate_event_size
+      self.__is_injective = is_injective
+      self.__is_permutation = is_permutation
+
+      if any(nd is None for nd in tf.nest.flatten(forward_min_event_ndims)):
+        # Infer forward_min_event_ndims by walking backwards through the graph.
+        forward_min_event_ndims = nest.map_structure_up_to(
+            forward_min_event_ndims,
+            lambda inferred: inferred.forward_min_event_ndims,
+            self._walk_inverse(
+                _update_forward_min_event_ndims,
+                tf.nest.map_structure(lambda x: None, forward_min_event_ndims)))
+      if any(nd is None for nd in tf.nest.flatten(inverse_min_event_ndims)):
+        # Infer forward_min_event_ndims by walking forwards through the graph.
+        inverse_min_event_ndims = nest.map_structure_up_to(
+            inverse_min_event_ndims,
+            lambda inferred: inferred.forward_min_event_ndims,
+            self._walk_forward(
+                _update_inverse_min_event_ndims,
+                tf.nest.map_structure(lambda x: None, inverse_min_event_ndims)))
 
       super(Composition, self).__init__(
           forward_min_event_ndims=forward_min_event_ndims,
@@ -140,13 +196,14 @@ class Composition(bijector.Bijector):
           name=name,
           **kwargs)
 
-      # Copy the nested structure so we don't mutate arguments during tracking.
-      self._bijectors = nest.map_structure(lambda b: b, bijectors)
-      self._validate_event_size = validate_event_size
-      self.__is_injective = is_injective
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict()
 
   @property
   def bijectors(self):
+    if isinstance(self._bijectors, Composition):
+      return self._bijectors.bijectors  # pylint: disable=protected-access
     return self._bijectors
 
   @property
@@ -156,6 +213,20 @@ class Composition(bijector.Bijector):
   @property
   def _is_injective(self):
     return self.__is_injective
+
+  @property
+  def _is_permutation(self):
+    return self.__is_permutation
+
+  @property
+  def _parts_interact(self):
+    # Parts of this Composition's inputs and outputs can interact if and only if
+    # they interact at some component bijector. Note that this may need to be
+    # overridden by subclasses such as `_DefaultJointBijector` that build
+    # component bijectors on the fly during each invocation, since that process
+    # can induce additional interactions.
+    return any(
+        b._parts_interact for b in tf.nest.flatten(self.bijectors))  # pylint: disable=protected-access
 
   # pylint: disable=redefined-builtin
 
@@ -284,16 +355,13 @@ class Composition(bijector.Bijector):
         transform_wrapper, packed_args, **kwargs)
     return unpack_structs_like(self.forward_min_event_ndims, packed_result)
 
-  ### Abstract Methods
-
-  @abc.abstractmethod
   def _walk_forward(self, step_fn, argument, **kwargs):
     """Subclass stub for forward-mode traversals.
 
     The `_walk_{direction}` methods define how arguments are routed through
     nested bijectors, expressing the directed topology of the underlying graph.
 
-    Arguments:
+    Args:
       step_fn: A method taking a bijector, a single positional argument
         matching `bijector.forward_min_event_ndims`, and arbitrary **kwargs,
         and returning a structure matching `bijector.inverse_min_event_ndims`.
@@ -301,18 +369,24 @@ class Composition(bijector.Bijector):
         `_call_walk_forward` instead.
       argument: A (structure of) Tensor matching `self.forward_min_event_ndims`.
       **kwargs: Keyword arguments to be forwarded to nested bijectors.
+    Returns:
+      bijectors_forward: The value returned by `self._bijectors._walk_forward`
+        if `self._bijectors` is a `Composition` bijector.
+    Raises:
+      NotImplementedError, if `self._bijectors` is a nested structure.
     """
+    if isinstance(self._bijectors, Composition):
+      return self._bijectors._walk_forward(step_fn, argument, **kwargs)  # pylint: disable=protected-access
     raise NotImplementedError('{}._walk_forward is not implemented'.format(
         type(self).__name__))
 
-  @abc.abstractmethod
   def _walk_inverse(self, step_fn, argument, **kwargs):
     """Subclass stub for inverse-mode traversals.
 
     The `_walk_{direction}` methods define how arguments are routed through
     nested bijectors, expressing the directed topology of the underlying graph.
 
-    Arguments:
+    Args:
       step_fn: A method taking a bijector, a single positional argument
         matching `bijector.inverse_min_event_ndims`, and arbitrary **kwargs,
         and returning a structure matching `bijector.forward_min_event_ndims`.
@@ -320,7 +394,14 @@ class Composition(bijector.Bijector):
         `_call_walk_inverse` instead.
       argument: A (structure of) Tensor matching `self.inverse_min_event_ndims`.
       **kwargs: Keyword arguments to be forwarded to nested bijectors.
+    Returns:
+      bijectors_inverse: The value returned by `self._bijectors._walk_inverse`
+        if `self._bijectors` is a `Composition` bijector.
+    Raises:
+      NotImplementedError, if `self._bijectors` is a nested structure.
     """
+    if isinstance(self._bijectors, Composition):
+      return self._bijectors._walk_inverse(step_fn, argument, **kwargs)  # pylint: disable=protected-access
     raise NotImplementedError('{}._walk_inverse is not implemented'.format(
         type(self).__name__))
 
@@ -330,18 +411,59 @@ class Composition(bijector.Bijector):
 
   ## LDJ Methods
 
-  # DAGs of bijectors do not generally have statically-known `min_event_ndims`
-  # in the way that most other bijectors do.
+  def _get_bijectors_with_metadata(self,
+                                   x,
+                                   event_ndims,
+                                   forward=True,
+                                   **kwargs):
+    """Trace bijectors + metadata forward/backward."""
+    bijectors_with_metadata = []
 
-  # Consider a single bijector that applies Exp() to a 2-tuple of Tensors with
-  # shapes `[2, 3]` and `[3, 2]`. Valid values for `event_ndims` may have
-  # different relative-ranks (e.g., `(2,2)` and `(1,0)`). Meanwhile,
-  # passing `(1,1)` would result in a broadcasting exception. This being the
-  # case, we cannot return a "minimally-reduced LDJ" without knowing both the
-  # event-dimensionality _and_ the shapes of inputs. As such, we forego
-  # intermediate LDJ caching entirely, and request fully-reduced LDJ from nested
-  # bijectors. This requires us to change the signature of
-  # `_{direction}_log_det_jacobian` to include `event_ndims`.
+    if forward:
+      forward_fn = lambda bij, *args, **kwargs: bij.forward(*args, **kwargs)
+      forward_event_ndims_fn = (
+          lambda bij, *args, **kwargs: bij.forward_event_ndims(*args, **kwargs))
+      walk_forward_fn = self._call_walk_forward
+    else:
+      forward_fn = lambda bij, *args, **kwargs: bij.inverse(*args, **kwargs)
+      forward_event_ndims_fn = (
+          lambda bij, *args, **kwargs: bij.inverse_event_ndims(*args, **kwargs))
+      walk_forward_fn = self._call_walk_inverse
+
+    def step(bij, x, x_event_ndims, increased_dof, **kwargs):  # pylint: disable=missing-docstring
+      # Transform inputs for the next bijector.
+      y = forward_fn(bij, x, **kwargs)
+      y_event_ndims = forward_event_ndims_fn(bij, x_event_ndims, **kwargs)
+
+      # Check if the inputs to this bijector have increased degrees of freedom
+      # due to some upstream bijector. We assume that the upstream bijector
+      # produced a valid LDJ, but this one does not (unless LDJ is 0, in which
+      # case it doesn't matter).
+      increased_dof = ps.reduce_any(nest.flatten(increased_dof))
+      if self.validate_event_size:
+        assertions = [
+            self._maybe_warn_increased_dof(
+                component_name=bij.name, increased_dof=increased_dof)
+        ]
+        increased_dof |= (_event_size(y, y_event_ndims)
+                          > _event_size(x, x_event_ndims))
+      else:
+        assertions = []
+
+      increased_dof = nest_util.broadcast_structure(y, increased_dof)
+      bijectors_with_metadata.append(
+          BijectorWithMetadata(
+              bijector=bij,
+              x=x,
+              x_event_ndims=x_event_ndims,
+              kwargs=kwargs,
+              assertions=assertions,
+          ))
+      return y, y_event_ndims, increased_dof
+
+    increased_dof = nest_util.broadcast_structure(event_ndims, False)
+    walk_forward_fn(step, x, event_ndims, increased_dof, **kwargs)
+    return bijectors_with_metadata
 
   def _call_forward_log_det_jacobian(self, x, event_ndims, name, **kwargs):
     """Compute forward_log_det_jacobian over the composition."""
@@ -351,53 +473,34 @@ class Composition(bijector.Bijector):
           x, name='x', dtype_hint=dtype,
           dtype=None if bijector.SKIP_DTYPE_CHECKS else dtype,
           allow_packing=True)
+      if event_ndims is None:
+        event_ndims = self.forward_min_event_ndims
       event_ndims = nest_util.coerce_structure(
           self.forward_min_event_ndims, event_ndims)
       return self._forward_log_det_jacobian(x, event_ndims, **kwargs)
 
   def _forward_log_det_jacobian(self, x, event_ndims, **kwargs):
-    # Container for accumulated LDJ.
+    bijectors_with_metadata = self._get_bijectors_with_metadata(
+        x, event_ndims, forward=True, **kwargs)
+
+    # We do a running sum for the purpose of dtype inference.
     ldj_sum = tf.zeros([], dtype=tf.float32)
-    # Container for accumulated assertions.
     assertions = []
 
-    def step(bij, x, x_event_ndims, increased_dof, **kwargs):  # pylint: disable=missing-docstring
-      nonlocal ldj_sum
-
-      # Compute the LDJ for this step, and add it to the rolling sum.
-      component_ldj = tf.convert_to_tensor(
-          bij.forward_log_det_jacobian(x, x_event_ndims, **kwargs),
+    for bm in bijectors_with_metadata:
+      ldj = tf.convert_to_tensor(
+          bm.bijector.forward_log_det_jacobian(bm.x, bm.x_event_ndims,
+                                               **bm.kwargs),
           dtype_hint=ldj_sum.dtype)
 
-      if not dtype_util.is_floating(component_ldj.dtype):
+      if not dtype_util.is_floating(ldj.dtype):
         raise TypeError(('Nested bijector "{}" of Composition "{}" returned '
-                         'LDJ with a non-floating dtype: {}')
-                        .format(bij.name, self.name, component_ldj.dtype))
-      ldj_sum = _max_precision_sum(ldj_sum, component_ldj)
+                         'FLDJ with a non-floating dtype: {}').format(
+                             bm.bijector.name, self.name, ldj.dtype))
+      ldj_sum = _max_precision_sum(ldj_sum, ldj)
+      assertions.extend(bm.assertions)
 
-      # Transform inputs for the next bijector.
-      y = bij.forward(x, **kwargs)
-      y_event_ndims = bij.forward_event_ndims(x_event_ndims, **kwargs)
-
-      # Check if the inputs to this bijector have increased degrees of freedom
-      # due to some upstream bijector. We assume that the upstream bijector
-      # produced a valid LDJ, but this one does not (unless LDJ is 0, in which
-      # case it doesn't matter).
-      increased_dof = ps.reduce_any(nest.flatten(increased_dof))
-      if self.validate_event_size:
-        assertions.append(self._maybe_warn_increased_dof(
-            component_name=bij.name,
-            component_ldj=component_ldj,
-            increased_dof=increased_dof))
-        increased_dof |= (_event_size(y, y_event_ndims)
-                          > _event_size(x, x_event_ndims))
-
-      increased_dof = nest_util.broadcast_structure(y, increased_dof)
-      return y, y_event_ndims, increased_dof
-
-    increased_dof = nest_util.broadcast_structure(event_ndims, False)
-    self._call_walk_forward(step, x, event_ndims, increased_dof, **kwargs)
-    with tf.control_dependencies([x for x in assertions if x is not None]):
+    with tf.control_dependencies(assertions):
       return tf.identity(ldj_sum, name='fldj')
 
   def _call_inverse_log_det_jacobian(self, y, event_ndims, name, **kwargs):
@@ -408,65 +511,71 @@ class Composition(bijector.Bijector):
           y, name='y', dtype_hint=dtype,
           dtype=None if bijector.SKIP_DTYPE_CHECKS else dtype,
           allow_packing=True)
+      if event_ndims is None:
+        event_ndims = self.inverse_min_event_ndims
       event_ndims = nest_util.coerce_structure(
           self.inverse_min_event_ndims, event_ndims)
       return self._inverse_log_det_jacobian(y, event_ndims, **kwargs)
 
   def _inverse_log_det_jacobian(self, y, event_ndims, **kwargs):
-    # Container for accumulated LDJ.
-    ldj_sum = tf.convert_to_tensor(0., dtype=tf.float32)
-    # Container for accumulated assertions.
+    bijectors_with_metadata = self._get_bijectors_with_metadata(
+        y, event_ndims, forward=False, **kwargs)
+
+    # We do a running sum for the purpose of dtype inference.
+    ldj_sum = tf.zeros([], dtype=tf.float32)
     assertions = []
 
-    def step(bij, y, y_event_ndims, increased_dof=False, **kwargs):  # pylint: disable=missing-docstring
-      nonlocal ldj_sum
-
-      # Compute the LDJ for this step, and add it to the rolling sum.
-      component_ldj = tf.convert_to_tensor(
-          bij.inverse_log_det_jacobian(y, y_event_ndims, **kwargs),
+    for bm in bijectors_with_metadata:
+      # N.B. x's are y's here.
+      ldj = tf.convert_to_tensor(
+          bm.bijector.inverse_log_det_jacobian(bm.x, bm.x_event_ndims,
+                                               **bm.kwargs),
           dtype_hint=ldj_sum.dtype)
 
-      if not dtype_util.is_floating(component_ldj.dtype):
+      if not dtype_util.is_floating(ldj.dtype):
         raise TypeError(('Nested bijector "{}" of Composition "{}" returned '
-                         'LDJ with a non-floating dtype: {}')
-                        .format(bij.name, self.name, component_ldj.dtype))
-      ldj_sum = _max_precision_sum(ldj_sum, component_ldj)
+                         'ILDJ with a non-floating dtype: {}')
+                        .format(bm.bijector.name, self.name, ldj.dtype))
+      ldj_sum = _max_precision_sum(ldj_sum, ldj)
+      assertions.extend(bm.assertions)
 
-      # Transform inputs for the next bijector.
-      x = bij.inverse(y, **kwargs)
-      x_event_ndims = bij.inverse_event_ndims(y_event_ndims, **kwargs)
-
-      # Check if the inputs to this bijector have increased degrees of freedom
-      # due to some upstream bijector. We assume that the upstream bijector
-      # produced a valid LDJ, but this one does not (unless LDJ is 0, in which
-      # case it doesn't matter).
-      increased_dof = ps.reduce_any(nest.flatten(increased_dof))
-      if self.validate_event_size:
-        assertions.append(self._maybe_warn_increased_dof(
-            component_name=bij.name,
-            component_ldj=component_ldj,
-            increased_dof=increased_dof))
-        increased_dof |= (_event_size(x, x_event_ndims)
-                          > _event_size(y, y_event_ndims))
-
-      increased_dof = nest_util.broadcast_structure(x, increased_dof)
-      return x, x_event_ndims, increased_dof
-
-    increased_dof = nest_util.broadcast_structure(event_ndims, False)
-    self._call_walk_inverse(step, y, event_ndims, increased_dof, **kwargs)
-    with tf.control_dependencies([x for x in assertions if x is not None]):
+    with tf.control_dependencies(assertions):
       return tf.identity(ldj_sum, name='ildj')
+
+  def _batch_shape(self, x_event_ndims):
+    """Broadcasts the batch shapes of component bijectors."""
+    batch_shapes_at_components = []
+
+    def _accumulate_batch_shapes_forward(bij, event_ndims):
+      batch_shapes_at_components.append(
+          bij.experimental_batch_shape(x_event_ndims=event_ndims))
+      return bij.forward_event_ndims(event_ndims)
+
+    # Populate 'batch_shapes_at_components' by walking forwards.
+    self._walk_forward(_accumulate_batch_shapes_forward, x_event_ndims)
+    return functools.reduce(tf.broadcast_static_shape,
+                            batch_shapes_at_components,
+                            tf.TensorShape([]))
+
+  def _batch_shape_tensor(self, x_event_ndims):
+    """Broadcasts the batch shapes of component bijectors."""
+    batch_shapes_at_components = []
+
+    def _accumulate_batch_shapes_forward(bij, event_ndims):
+      batch_shapes_at_components.append(
+          bij.experimental_batch_shape_tensor(x_event_ndims=event_ndims))
+      return bij.forward_event_ndims(event_ndims)
+
+    # Populate 'batch_shapes_at_components' by walking forwards.
+    self._walk_forward(_accumulate_batch_shapes_forward, x_event_ndims)
+    return functools.reduce(ps.broadcast_shape,
+                            batch_shapes_at_components,
+                            [])
 
   def _maybe_warn_increased_dof(self,
                                 component_name,
-                                component_ldj,
                                 increased_dof):
     """Warns or raises when `increased_dof` is True."""
-    # Short-circuit when the component LDJ is statically zero.
-    if (tf.get_static_value(tf.rank(component_ldj)) == 0
-        and tf.get_static_value(component_ldj) == 0):
-      return
-
     # Short-circuit when increased_dof is statically False.
     increased_dof_ = tf.get_static_value(increased_dof)
     if increased_dof_ is False:  # pylint: disable=g-bool-id-comparison
@@ -483,6 +592,10 @@ class Composition(bijector.Bijector):
       if increased_dof_:
         raise ValueError(error_message)
       return assert_util.assert_equal(False, increased_dof, error_message)
+
+    if (not tf.executing_eagerly() and
+        control_flow_util.GraphOrParentsInXlaContext(tf1.get_default_graph())):
+      return  # No StringFormat or Print ops in XLA.
 
     # Otherwise, we print a warning and continue.
     return ps.cond(
@@ -540,16 +653,190 @@ class Composition(bijector.Bijector):
         y, **kwargs)
 
   def forward_event_ndims(self, event_ndims, **kwargs):
-    if self._has_static_min_event_ndims:
-      return super(Composition, self).forward_event_ndims(event_ndims, **kwargs)
-    return self._call_walk_forward(
-        lambda b, nd, **kwds: b.forward_event_ndims(nd, **kwds),
-        event_ndims, **kwargs)
+    if tf.nest.is_nested(event_ndims) and not self._parts_interact:
+      return self._call_walk_forward(
+          lambda b, nd, **kwds: b.forward_event_ndims(nd, **kwds),
+          event_ndims, **kwargs)
+    return super(Composition, self).forward_event_ndims(event_ndims, **kwargs)
 
   def inverse_event_ndims(self, event_ndims, **kwargs):
-    if self._has_static_min_event_ndims:
-      return super(Composition, self).inverse_event_ndims(event_ndims, **kwargs)
-    return self._call_walk_inverse(
-        lambda b, nd, **kwds: b.inverse_event_ndims(nd, **kwds),
-        event_ndims, **kwargs)
+    if tf.nest.is_nested(event_ndims) and not self._parts_interact:
+      return self._call_walk_inverse(
+          lambda b, nd, **kwds: b.inverse_event_ndims(nd, **kwds),
+          event_ndims, **kwargs)
+    return super(Composition, self).inverse_event_ndims(event_ndims, **kwargs)
 
+
+def _update_forward_min_event_ndims(
+    bij,
+    downstream_quantities,
+    get_forward_min_event_ndims=lambda b: b.forward_min_event_ndims,
+    get_inverse_min_event_ndims=lambda b: b.inverse_min_event_ndims,
+    inverse_event_ndims_fn=lambda b, nd: b.inverse_event_ndims(nd)):
+  """Step backwards through the graph to infer `forward_min_event_ndims`.
+
+  Args:
+    bij: local tfb.Bijector instance at the current graph node.
+    downstream_quantities: Instance of `MinEventNdimsDownstreamQuantities`
+      namedtuple, containing event_ndims that satisfy the bijector(s)
+      downstream from `bij` in the graph. May be `None` if there are no such
+      bijectors.
+    get_forward_min_event_ndims: callable; may be overridden to swap
+      forward/inverse direction.
+    get_inverse_min_event_ndims: callable; may be overridden to swap
+      forward/inverse direction.
+    inverse_event_ndims_fn: callable; may be overridden to swap
+      forward/inverse direction.
+  Returns:
+    downstream_quantities: Instance of `MinEventNdimsDownstreamQuantities`
+      namedtuple containing event_ndims that satisfy `bij` and all downstream
+      bijectors.
+  """
+  if downstream_quantities is None:  # This is a leaf bijector.
+    return MinEventNdimsInferenceDownstreamQuantities(
+        forward_min_event_ndims=get_forward_min_event_ndims(bij),
+        parts_interact=bij._parts_interact)  # pylint: disable=protected-access
+
+  inverse_min_event_ndims = get_inverse_min_event_ndims(bij)
+  downstream_min_event_ndims = nest_util.coerce_structure(
+      inverse_min_event_ndims,
+      downstream_quantities.forward_min_event_ndims)
+
+  # Update the min_event_ndims that is a valid input to downstream bijectors
+  # to also be a valid *output* of this bijector, or equivalently, a valid
+  # input to `bij.inverse`.
+  rank_mismatches = tf.nest.flatten(
+      tf.nest.map_structure(
+          lambda dim, min_dim: dim - min_dim,
+          downstream_min_event_ndims,
+          inverse_min_event_ndims))
+  if downstream_quantities.parts_interact:
+    # If downstream bijectors involve interaction between parts,
+    # then a valid input to the downstream bijectors must augment the
+    # `downstream_min_event_ndims` by the
+    # same rank for every part (otherwise we would induce event shape
+    # broadcasting). Hopefully, this will also avoid event-shape broadcasting
+    # at the current bijector---if not, the composition is invalid, and the call
+    # to `bij.inverse_event_ndims(valid_inverse_min_event_ndims)` below will
+    # raise an exception.
+    maximum_rank_deficiency = -ps.reduce_min([0] + rank_mismatches)
+    valid_inverse_min_event_ndims = tf.nest.map_structure(
+        lambda ndims: maximum_rank_deficiency + ndims,
+        downstream_min_event_ndims)
+  else:
+    if bij._parts_interact:  # pylint: disable=protected-access
+      # If this bijector does *not* operate independently on its parts, then a
+      # valid input to `inverse` cannot require event shape broadcasting. That
+      # is, each part must have the same 'excess rank' above the local
+      # inverse_min_event_ndims; we ensure this by construction.
+      maximum_excess_rank = ps.reduce_max([0] + rank_mismatches)
+      valid_inverse_min_event_ndims = tf.nest.map_structure(
+          lambda ndims: maximum_excess_rank + ndims,
+          inverse_min_event_ndims)
+    else:
+      # If all parts are independent, can take the pointwise max event_ndims.
+      valid_inverse_min_event_ndims = tf.nest.map_structure(
+          ps.maximum, downstream_min_event_ndims, inverse_min_event_ndims)
+
+  return MinEventNdimsInferenceDownstreamQuantities(
+      # Pull the desired output ndims back through the bijector, to get
+      # the ndims of a valid *input*.
+      forward_min_event_ndims=inverse_event_ndims_fn(
+          bij, valid_inverse_min_event_ndims),
+      parts_interact=(
+          downstream_quantities.parts_interact or
+          bij._parts_interact))  # pylint: disable=protected-access
+
+_update_inverse_min_event_ndims = functools.partial(
+    _update_forward_min_event_ndims,
+    get_forward_min_event_ndims=lambda b: b.inverse_min_event_ndims,
+    get_inverse_min_event_ndims=lambda b: b.forward_min_event_ndims,
+    inverse_event_ndims_fn=lambda b, nd: b.forward_event_ndims(nd))
+
+
+@ldj_ratio_lib.RegisterFLDJRatio(Composition)
+def _fldj_ratio_composition(p, x, q, y, event_ndims, p_kwargs, q_kwargs):
+  """Composition FLDJ ratio."""
+  p_bijectors_with_metadata = p._get_bijectors_with_metadata(  # pylint: disable=protected-access
+      x, event_ndims, forward=True, **p_kwargs)
+  q_bijectors_with_metadata = q._get_bijectors_with_metadata(  # pylint: disable=protected-access
+      y, event_ndims, forward=True, **q_kwargs)
+
+  if len(p_bijectors_with_metadata) != len(q_bijectors_with_metadata):
+    raise ValueError(
+        f'Composition "{p.name}" and "{q.name}" have different numbers of '
+        f'component bijectors: {len(p_bijectors_with_metadata)} != '
+        f'{len(q_bijectors_with_metadata)}.')
+
+  # We do a running sum for the purpose of dtype inference.
+  ldj_ratio_sum = tf.zeros([], dtype=tf.float32)
+  assertions = []
+
+  for p_bm, q_bm in zip(p_bijectors_with_metadata, q_bijectors_with_metadata):
+    ldj_ratio = ldj_ratio_lib.forward_log_det_jacobian_ratio(
+        p=p_bm.bijector,
+        x=p_bm.x,
+        q=q_bm.bijector,
+        y=q_bm.x,
+        event_ndims=p_bm.x_event_ndims,
+        p_kwargs=p_bm.kwargs,
+        q_kwargs=q_bm.kwargs)
+
+    ldj_ratio = tf.convert_to_tensor(ldj_ratio, dtype_hint=ldj_ratio_sum.dtype)
+
+    if not dtype_util.is_floating(ldj_ratio.dtype):
+      raise TypeError(
+          f'Nested bijector "{p_bm.bijector.name}" of Composition "{p.name}" '
+          f'and bijector "{q_bm.bijector.name}" of Composition "{q.name}" '
+          f'returned FLDJ ratio with a non-floating dtype: {ldj_ratio.dtype}')
+    ldj_ratio_sum = _max_precision_sum(ldj_ratio_sum, ldj_ratio)
+    assertions.extend(p_bm.assertions)
+    assertions.extend(q_bm.assertions)
+
+  with tf.control_dependencies(
+      assertions):
+    return tf.identity(ldj_ratio_sum, name='fldj_ratio')
+
+
+@ldj_ratio_lib.RegisterILDJRatio(Composition)
+def _ildj_ratio_composition(p, x, q, y, event_ndims, p_kwargs, q_kwargs):
+  """Composition ILDJ ratio."""
+  p_bijectors_with_metadata = p._get_bijectors_with_metadata(  # pylint: disable=protected-access
+      x, event_ndims, forward=False, **p_kwargs)
+  q_bijectors_with_metadata = q._get_bijectors_with_metadata(  # pylint: disable=protected-access
+      y, event_ndims, forward=False, **q_kwargs)
+
+  if len(p_bijectors_with_metadata) != len(q_bijectors_with_metadata):
+    raise ValueError(
+        f'Composition "{p.name}" and "{q.name}" have different numbers of '
+        f'component bijectors: {len(p_bijectors_with_metadata)} != '
+        f'{len(q_bijectors_with_metadata)}.')
+
+  # We do a running sum for the purpose of dtype inference.
+  ldj_ratio_sum = tf.zeros([], dtype=tf.float32)
+  assertions = []
+
+  for p_bm, q_bm in zip(p_bijectors_with_metadata, q_bijectors_with_metadata):
+    ldj_ratio = ldj_ratio_lib.inverse_log_det_jacobian_ratio(
+        p=p_bm.bijector,
+        x=p_bm.x,
+        q=q_bm.bijector,
+        y=q_bm.x,
+        event_ndims=p_bm.x_event_ndims,
+        p_kwargs=p_bm.kwargs,
+        q_kwargs=q_bm.kwargs)
+
+    ldj_ratio = tf.convert_to_tensor(ldj_ratio, dtype_hint=ldj_ratio_sum.dtype)
+
+    if not dtype_util.is_floating(ldj_ratio.dtype):
+      raise TypeError(
+          f'Nested bijector "{p_bm.bijector.name}" of Composition "{p.name}" '
+          f'and bijector "{q_bm.bijector.name}" of Composition "{q.name}" '
+          f'returned ILDJ ratio with a non-floating dtype: {ldj_ratio.dtype}')
+    ldj_ratio_sum = _max_precision_sum(ldj_ratio_sum, ldj_ratio)
+    assertions.extend(p_bm.assertions)
+    assertions.extend(q_bm.assertions)
+
+  with tf.control_dependencies(
+      assertions):
+    return tf.identity(ldj_ratio_sum, name='ildj_ratio')

@@ -47,6 +47,7 @@ from tensorflow_probability.python.internal import samplers
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.internal import tensorshape_util
 from tensorflow_probability.python.math.numeric import clip_by_value_preserve_gradient
+from tensorflow_probability.python.random import random_ops
 from tensorflow.python.ops import control_flow_util  # pylint: disable=g-direct-tensorflow-import
 
 
@@ -55,7 +56,7 @@ __all__ = [
 ]
 
 
-class _ClipByValue(bijector_lib.Bijector):
+class _ClipByValue(bijector_lib.AutoCompositeTensorBijector):
   """A bijector that clips by value.
 
   This class is intended for minute numerical issues where `|clip(x) - x| <=
@@ -108,16 +109,6 @@ class _ClipByValue(bijector_lib.Bijector):
     return tf.zeros([], dtype=dtype_util.base_dtype(x.dtype))
 
 
-def _uniform_unit_norm(dimension, shape, dtype, seed):
-  """Returns a batch of points chosen uniformly from the unit hypersphere."""
-  # This works because the Gaussian distribution is spherically symmetric.
-  # raw shape: shape + [dimension]
-  raw = samplers.normal(
-      shape=ps.concat([shape, [dimension]], axis=0), seed=seed, dtype=dtype)
-  unit_norm = raw / tf.norm(raw, ord=2, axis=-1)[..., tf.newaxis]
-  return unit_norm
-
-
 def _replicate(n, tensor):
   """Replicate the input tensor n times along a new (major) dimension."""
   # TODO(axch) Does this already exist somewhere?  Should it get contributed?
@@ -142,7 +133,7 @@ def sample_lkj(
       distribution.
     cholesky_space: Python `bool`. Whether to take samples from LKJ or
       Chol(LKJ).
-    seed: Python integer seed for RNG
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
     name: Python `str` name prefixed to Ops created by this function.
 
   Returns:
@@ -215,8 +206,10 @@ def sample_lkj(
       distance = tf.sqrt(norm)[..., tf.newaxis]
       # direction is u in reference [1].
       # direction shape: B + [n]
-      direction = _uniform_unit_norm(
-          n, concentration_shape, concentration.dtype,
+      direction = random_ops.spherical_uniform(
+          shape=concentration_shape,
+          dimension=n,
+          dtype=concentration.dtype,
           seed=seeds.pop())
       # raw_correlation is w in reference [1].
       raw_correlation = distance * direction  # shape: B + [n]
@@ -269,7 +262,7 @@ def sample_lkj(
     return result
 
 
-class LKJ(distribution.Distribution):
+class LKJ(distribution.AutoCompositeTensorDistribution):
   """The LKJ distribution on correlation matrices.
 
   This is a one-parameter family of distributions on correlation matrices.  The
@@ -385,12 +378,6 @@ class LKJ(distribution.Distribution):
     """Boolean indicating if `Tensor` input/outputs are Cholesky factorized."""
     return self._input_output_cholesky
 
-  def _batch_shape_tensor(self):
-    return ps.shape(self.concentration)
-
-  def _batch_shape(self):
-    return self.concentration.shape
-
   def _event_shape_tensor(self):
     return tf.constant([self.dimension, self.dimension], dtype=tf.int32)
 
@@ -402,7 +389,7 @@ class LKJ(distribution.Distribution):
 
     Args:
       num_samples: Python `int`. The number of samples to draw.
-      seed: Python integer seed for RNG
+      seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
       name: Python `str` name prefixed to Ops created by this function.
 
     Returns:

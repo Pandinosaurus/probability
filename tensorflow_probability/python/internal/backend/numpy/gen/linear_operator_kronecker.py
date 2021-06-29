@@ -74,14 +74,15 @@ def _rotate_last_dim(x, rotate_right=False):
   ndims = array_ops.rank(x)
   if rotate_right:
     transpose_perm = array_ops.concat(
-        [[ndims - 1], math_ops.range(0, ndims - 1)], axis=0)
+        [[ndims - 1], array_ops.range(0, ndims - 1)], axis=0)
   else:
     transpose_perm = array_ops.concat(
-        [math_ops.range(1, ndims), [0]], axis=0)
+        [array_ops.range(1, ndims), [0]], axis=0)
   return array_ops.transpose(x, transpose_perm)
 
 
 # @tf_export("linalg.LinearOperatorKronecker")
+# @linear_operator.make_composite_tensor
 class LinearOperatorKronecker(linear_operator.LinearOperator):
   """Kronecker product between two `LinearOperators`.
 
@@ -249,7 +250,6 @@ class LinearOperatorKronecker(linear_operator.LinearOperator):
     with ops.name_scope(name, values=graph_parents):
       super(LinearOperatorKronecker, self).__init__(
           dtype=dtype,
-          graph_parents=None,
           is_non_singular=is_non_singular,
           is_self_adjoint=is_self_adjoint,
           is_positive_definite=is_positive_definite,
@@ -608,6 +608,10 @@ class LinearOperatorKronecker(linear_operator.LinearOperator):
       raise errors.InvalidArgumentError(
           node_def=None, op=None, message="All Kronecker factors must be "
           "square for the product to be self adjoint.")
+
+  @property
+  def _composite_tensor_fields(self):
+    return ("operators",)
 
 import numpy as np
 from tensorflow_probability.python.internal.backend.numpy import linalg_impl as _linalg

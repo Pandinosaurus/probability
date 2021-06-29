@@ -24,26 +24,27 @@ from tensorflow_probability.python.bijectors import bijector
 
 
 __all__ = [
-    "Tanh",
+    'Tanh',
 ]
 
 
-class Tanh(bijector.Bijector):
+class Tanh(bijector.AutoCompositeTensorBijector):
   """Bijector that computes `Y = tanh(X)`, therefore `Y in (-1, 1)`.
 
   This can be achieved by an affine transform of the Sigmoid bijector, i.e.,
   it is equivalent to
   ```
-  tfb.Chain([tfb.Affine(shift=-1, scale=2.),
+  tfb.Chain([tfb.Shift(shift=-1.),
+             tfb.Scale(scale=2.),
              tfb.Sigmoid(),
-             tfb.Affine(scale=2.)])
+             tfb.Scale(scale=2.)])
   ```
 
   However, using the `Tanh` bijector directly is slightly faster and more
   numerically stable.
   """
 
-  def __init__(self, validate_args=False, name="tanh"):
+  def __init__(self, validate_args=False, name='tanh'):
     parameters = dict(locals())
     with tf.name_scope(name) as name:
       super(Tanh, self).__init__(
@@ -55,6 +56,10 @@ class Tanh(bijector.Bijector):
   @classmethod
   def _is_increasing(cls):
     return True
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    return dict()
 
   def _forward(self, x):
     return tf.math.tanh(x)

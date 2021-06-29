@@ -66,12 +66,12 @@ class _TruncatedNormalTestCase(test_util.TestCase):
 
   def assertAllGreaterEqual(self, a, b):
     comparison = a >= b
-    all_true = np.ones_like(comparison, dtype=np.bool)
+    all_true = np.ones_like(comparison, dtype=np.bool_)
     self.assertAllEqual(comparison, all_true)
 
   def assertAllLessEqual(self, a, b):
     comparison = a <= b
-    all_true = np.ones_like(comparison, dtype=np.bool)
+    all_true = np.ones_like(comparison, dtype=np.bool_)
     self.assertAllEqual(comparison, all_true)
 
   def assertEmpiricalDistributionsEqual(self, sample_a, sample_b, rtol=1e-6,
@@ -380,7 +380,7 @@ class TruncatedNormalStandaloneTestCase(_TruncatedNormalTestCase):
 
   def testSampleXLA(self):
     self.skip_if_no_xla()
-    @tf.function(experimental_compile=True)
+    @tf.function(jit_compile=True)
     def f(loc):
       return tfd.TruncatedNormal(
           loc=loc, scale=1., low=-1., high=1.).sample(
@@ -582,6 +582,12 @@ class TruncatedNormalTestCompareWithScipy(_TruncatedNormalTestCase):
         self.evaluate(tf_dist.mean()), sp_dist.mean(), places=3)
     self.assertAlmostEqual(
         self.evaluate(tf_dist.variance()), sp_dist.var(), places=3)
+
+  def testQuantile(self, loc, scale, low, high):
+    tf_dist, sp_dist = self.constructDists(loc, scale, low, high)
+    for q in [0.01, 0.1, 0.5, 0.9, 0.99]:
+      self.assertAlmostEqual(
+          self.evaluate(tf_dist.quantile(value=q)), sp_dist.ppf(q=q), places=3)
 
 
 if __name__ == '__main__':

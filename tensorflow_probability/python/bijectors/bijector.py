@@ -23,32 +23,75 @@ import contextlib
 
 # Dependency imports
 import numpy as np
-import six
 import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python.internal import assert_util
+from tensorflow_probability.python.internal import auto_composite_tensor
+from tensorflow_probability.python.internal import batch_shape_lib
 from tensorflow_probability.python.internal import cache_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import name_util
 from tensorflow_probability.python.internal import nest_util
 from tensorflow_probability.python.internal import prefer_static as ps
+from tensorflow_probability.python.internal import tensorshape_util
+from tensorflow_probability.python.math import generic as math_generic
 from tensorflow_probability.python.math import gradient
-from tensorflow.python.util import nest  # pylint: disable=g-direct-tensorflow-import
-
+# pylint: disable=g-direct-tensorflow-import
+from tensorflow.python.util import deprecation
+from tensorflow.python.util import nest
+# pylint: enable=g-direct-tensorflow-import
 
 __all__ = [
     'Bijector',
+    'AutoCompositeTensorBijector',
 ]
 
-
+JAX_MODE = False
 SKIP_DTYPE_CHECKS = False
 
 # Singleton object representing "no value", in cases where "None" is meaningful.
 UNSPECIFIED = object()
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Bijector(tf.Module):
+class _BijectorMeta(abc.ABCMeta):
+  """Helper metaclass for tfp.Bijector."""
+
+  def __init__(cls, name, bases, dct):
+    super(_BijectorMeta, cls).__init__(name, bases, dct)
+    if not JAX_MODE:
+      return
+    def flatten(bij):
+      param_names = set(bij._composite_tensor_nonshape_params)  # pylint: disable=protected-access
+      components = {param_name: getattr(
+          bij, param_name, value) for param_name, value
+                    in bij.parameters.items() if param_name in param_names}
+      metadata = {param_name: value for param_name, value
+                  in bij.parameters.items() if param_name not in param_names}
+      if components:
+        keys, values = zip(*sorted(components.items()))
+      else:
+        keys, values = (), ()
+      # Mimics the logic in `tfp.experimental.composite_tensor` where we
+      # aggressively try to convert arguments into Tensors.
+      def _maybe_convert_to_tensor(value, name):
+        try:
+          value = tf.convert_to_tensor(value, name=name)
+        except (ValueError, TypeError, AssertionError):
+          pass
+        return value
+      values = tuple([_maybe_convert_to_tensor(value, name) for value, name,
+                      in zip(values, keys)])
+      return values, (keys, metadata)
+    def unflatten(info, xs):
+      keys, metadata = info
+      parameters = dict(list(zip(keys, xs)), **metadata)
+      return cls(**parameters)
+    from jax import tree_util  # pylint: disable=g-import-not-at-top
+    tree_util.register_pytree_node(cls, flatten, unflatten)
+
+
+# TODO(emilyaf): Look at using `__init_subclass__` instead of a metaclass.
+class Bijector(tf.Module, metaclass=_BijectorMeta):
   r"""Interface for transformations of a `Distribution` sample.
 
   Bijectors can be used to represent any differentiable and injective
@@ -198,15 +241,15 @@ class Bijector(tf.Module):
 
   Some examples:
 
-  `AffineScalar:  min_event_ndims=0`
-  `Affine:  min_event_ndims=1`
   `Cholesky:  min_event_ndims=2`
   `Exp:  min_event_ndims=0`
+  `MatvecTriL: min_event_ndims=1`
+  `Scale:  min_event_ndims=0`
   `Sigmoid:  min_event_ndims=0`
   `SoftmaxCentered:  min_event_ndims=1`
 
-  Note the difference between `Affine` and `AffineScalar`. `AffineScalar`
-  operates on scalar events, whereas `Affine` operates on vector-valued events.
+  For multiplicative transformations, note that `Scale` operates on scalar
+  events, whereas the `Matvec*` bijectors operate on vector-valued events.
 
   More generally, there is a `forward_min_event_ndims` and an
   `inverse_min_event_ndims`. In most cases, these will be the same.
@@ -229,22 +272,46 @@ class Bijector(tf.Module):
 
   Note: By default, we require `shape(x[i])[-event_ndims:-min_event_ndims]` to
   be identical for all elements `i` of the structured input `x`. Specifically,
-  broadcasting over non-minimal event-dims is not allowed for structured inputs.
-  In cases where broadcasting is used as a "computational shorthand" for a dense
-  operation (that is, the _broadcasted_ inputs are assumed to be independent),
-  users should set `bijector._allow_event_shape_broadcasting = True`.
+  broadcasting over non-minimal event-dims is generally not allowed for
+  structured inputs, with the exception described in the next paragraph.
 
-  Finally, some bijectors that operate on structures of inputs may not know
-  the minimum structured rank of their inputs without calltime shape information
-  (Composite bijectors, for example). In these cases, both `min_event_ndims`
-  properties will indicate the expected *structure* of inputs and outputs,
-  but the component values may be `None`.
+  **Independent parts**: multipart transformations in which the parts do not
+  interact with each other, such as `tfd.JointMap`, `tfd.Restructure`, and
+  chains of these, may allow `event_ndims[i] - min_event_ndims[i]` to take
+  different values across different parts. The parts must still share a common
+  (broadcast) batch shape---the shape of the log Jacobian determinant---
+  but independence removes the requirement for further alignment in the event
+  shapes. For example, a `JointMap` bijector may be used to transform
+  distributions of varying event rank and size, even when other multipart
+  bijectors such as `tfb.Invert(tfb.Split(n))` would require all inputs to have
+  the same event rank:
+
+  ```python
+  jm = tfb.JointMap([tfb.Scale([1., 2.],
+                     tfb.Scale([3., 4., 5.]))])
+
+  fldj = jm.forward_log_det_jacobian([tf.ones([2]), tf.ones([3])],
+                                      event_ndims=[1, 1])
+  # ==> `fldj` has shape `[]`.
+
+  fldj = jm.forward_log_det_jacobian([tf.ones([2]), tf.ones([3])],
+                                      event_ndims=[1, 0])
+  # ==> `fldj` has shape `[3]` (the shape-`[2]` input part is implicitly
+  #      broadcast to shape `[3, 2]`, creating a common batch shape).
+
+  fldj = jm.forward_log_det_jacobian([tf.ones([2]), tf.ones([3])],
+                                      event_ndims=[0, 0])
+  # ==> Error; `[2]` and `[3]` do not broadcast to a consistent batch shape.
+
+  ```
 
   #### Jacobian Determinant
 
-  The Jacobian determinant is a reduction over `event_ndims - min_event_ndims`
-  (`forward_min_event_ndims` for `forward_log_det_jacobian` and
-  `inverse_min_event_ndims` for `inverse_log_det_jacobian`).
+  The Jacobian determinant of a single-part bijector is a reduction over
+  `event_ndims - min_event_ndims` (`forward_min_event_ndims` for
+  `forward_log_det_jacobian` and `inverse_min_event_ndims` for
+  `inverse_log_det_jacobian`).
+
   To see this, consider the `Exp` `Bijector` applied to a `Tensor` which has
   sample, batch, and event (S, B, E) shape semantics. Suppose the `Tensor`'s
   partitioned-shape is `(S=[4], B=[2], E=[3, 3])`. The shape of the `Tensor`
@@ -287,9 +354,15 @@ class Bijector(tf.Module):
       The claim follows from [properties of determinant](
   https://en.wikipedia.org/wiki/Determinant#Multiplicativity_and_matrix_groups).
 
-  Generally its preferable to directly implement the inverse Jacobian
+  Generally it's preferable to directly implement the inverse Jacobian
   determinant.  This should have superior numerical stability and will often
   share subgraphs with the `_inverse` implementation.
+
+  Note that Jacobian determinants are always a single Tensor (potentially with
+  batch dimensions), even for bijectors that act on multipart structures, since
+  any multipart transformation may be viewed as a transformation on a single
+  (possibly batched) vector obtained by flattening and
+  concatenating the input parts.
 
   #### Is_constant_jacobian
 
@@ -365,6 +438,8 @@ class Bijector(tf.Module):
 
       - _forward_dtype
       - _inverse_dtype
+      - _forward_event_ndims
+      - _inverse_event_ndims
 
   - If the `Bijector`'s use is limited to `TransformedDistribution` (or friends
     like `QuantizedDistribution`) then depending on your use, you may not need
@@ -457,6 +532,7 @@ class Bijector(tf.Module):
                dtype=None,
                forward_min_event_ndims=UNSPECIFIED,
                inverse_min_event_ndims=UNSPECIFIED,
+               experimental_use_kahan_sum=False,
                parameters=None,
                name=None):
     """Constructs Bijector.
@@ -490,6 +566,11 @@ class Bijector(tf.Module):
       inverse_min_event_ndims: Python `integer` (structure) indicating the
         minimum number of dimensions on which `inverse` operates. Will be set to
         `forward_min_event_ndims` by default, if no value is provided.
+      experimental_use_kahan_sum: Python `bool`. When `True`, use Kahan
+        summation to aggregate log-det jacobians from independent underlying
+        log-det jacobian values, which improves against the precision of a naive
+        float32 sum. This can be noticeable in particular for large dimensions
+        in float32. See CPU caveat on `tfp.math.reduce_kahan_sum`.
       parameters: Python `dict` of parameters used to instantiate this
         `Bijector`. Bijector instances with identical types, names, and
         `parameters` share an input/output cache. `parameters` dicts are
@@ -511,17 +592,32 @@ class Bijector(tf.Module):
     name = name_util.strip_invalid_chars(name)
     super(Bijector, self).__init__(name=name)
     self._name = name
-    self._parameters = self._no_dependency(parameters)
+    # TODO(b/176242804): Infer `parameters` if not specified by the child class.
+
+    if parameters is None:
+      self._parameters = None
+    else:
+      self._parameters = self._no_dependency(
+          {k: v for k, v in parameters.items()
+           if not k.startswith('__') and k != 'self'})
 
     self._graph_parents = self._no_dependency(graph_parents or [])
 
     self._is_constant_jacobian = is_constant_jacobian
     self._validate_args = validate_args
     self._dtype = dtype
+    self._use_kahan_sum = experimental_use_kahan_sum
 
-    self._initial_parameter_control_dependencies = tuple(
-        d for d in self._parameter_control_dependencies(is_init=True)
-        if d is not None)
+    self._defer_all_assertions = (
+        auto_composite_tensor.is_deferred_assertion_context())
+
+    if not self._defer_all_assertions:
+      self._initial_parameter_control_dependencies = tuple(
+          d for d in self._parameter_control_dependencies(is_init=True)
+          if d is not None)
+    else:
+      self._initial_parameter_control_dependencies = ()
+
     if self._initial_parameter_control_dependencies:
       self._initial_parameter_control_dependencies = (
           tf.group(*self._initial_parameter_control_dependencies),)
@@ -543,14 +639,6 @@ class Bijector(tf.Module):
     # structures, so it is important that we retain the original containers.
     self._forward_min_event_ndims = self._no_dependency(forward_min_event_ndims)
     self._inverse_min_event_ndims = self._no_dependency(inverse_min_event_ndims)
-    self._has_static_min_event_ndims = None not in (
-        nest.flatten([forward_min_event_ndims, inverse_min_event_ndims]))
-
-    # Whether to allow broadcasting over the (non-minimal) event-shape for
-    # structured inputs. When `False` (default), assert that LDJ reduction
-    # shapes are identical for all components of nested inputs. When `True`,
-    # event-shape broadcasing is allow, but LDJ may be incorrect.
-    self._allow_event_shape_broadcasting = False
 
     # Batch shape implied by the bijector's parameters, for use in validating
     # LDJ shapes (currently only used in multipart bijectors.)
@@ -586,9 +674,13 @@ class Bijector(tf.Module):
     return self._inverse_min_event_ndims
 
   @property
+  @deprecation.deprecated(
+      '2021-08-01',
+      '`min_event_ndims` is now static for all bijectors; this property is '
+      'no longer needed.')
   def has_static_min_event_ndims(self):
     """Returns True if the bijector has statically-known `min_event_ndims`."""
-    return self._has_static_min_event_ndims
+    return True
 
   @property
   def is_constant_jacobian(self):
@@ -624,6 +716,88 @@ class Bijector(tf.Module):
             tf.get_static_value(self._inverse_min_event_ndims) == 0)
 
   @property
+  def _is_permutation(self):
+    """Whether `y` is purely a reordering / restructuring of `x`."""
+    return False
+
+  @property
+  def _parts_interact(self):
+    """Whether the parts of a multipart `x` or `y` interact with each other.
+
+    If `True`, all `Tensor` parts of an input `x` or `y` must have the same
+    event shape except for the rightmost `min_event_ndims` dimensions (which
+    the bijector may allow to vary). In particular, the value of
+    `event_ndims[i] - min_event_ndims[i]` must be the same for all parts `i`.
+
+    If `False`, an input's `Tensor` parts may have arbitrary event shapes,
+    although their batch shapes must still broadcast to a common batch shape.
+    To support this flexibility, a bijector subclass will typically need to
+    return a *structure* of log-det-jacobians from its
+    `_{forward/inverse}_log_det_jacobian` methods, to be summed by the base
+    class, since different parts may require different degrees of reduction
+    in order to produce a scalar Jacobian determinant for each event.
+
+    This property affects validation of inputs to
+    forward/inverse_log_det_jacobian methods: specifying `parts_interact=False`
+    may lead to silently incorrect ldj's via broadcasting if the parts do, in
+    fact, interact. It also determines the `min_event_ndims` required by Chains
+    and other compositions that include this bijector.
+
+    For example, the bijector
+    `jm = tfb.JointMap([tfb.CholeskyOuterProduct(), tfb.Square()])`
+    on its own has `forward_min_event_ndims = inverse_min_event_ndims = [2, 0]`.
+    Suppose we chain it with one of the following two bijectors `b1` or
+    `b2`, both of which have
+    `forward_min_event_ndims = inverse_min_event_ndims = [1, 1]`.
+
+    ```python
+    # JointMap: `parts_interact` is False.
+    b1 = tfb.JointMap([tfb.SoftmaxCentered(), tfb.SoftmaxCentered()])
+    # Split: `parts_interact` is True.
+    b2 = tfb.Chain([Split(2), tfb.Invert(tfb.Split(2))])
+
+    c1 = tfb.Chain([jm, b1])
+    # ==> c1.forward_min_event_ndims == [2, 1]
+    # ==> c1.inverse_min_event_ndims == [2, 1]
+
+    c2 = tfb.Chain([jm, b2])
+    # ==> c2.forward_min_event_ndims == [2, 2]
+    # ==> c2.inverse_min_event_ndims == [2, 2]
+    ```
+
+    In both cases, the initial bijector in the chain takes and returns a
+    structured input of rank `[1, 1]`, but the CholeskyOuterProduct lurking
+    behind it needs a rank-2 input. In `c1`, the parts of the initial
+    bijector don't interact, so it's sufficient to pass this second dimension
+    in the first part alone, for a forward min_event_ndims of `[2, 1]`. In `c2`,
+    however, the extra dimension must be present in every part of the input.
+    If we ignored this and tried to use `c2` to transform a distribution with
+    event rank `[2, 1]`, bad things would happen:
+
+    1. We'd get an error from attempting to `tf.concat` two values of different
+       rank.
+    2. Suppose that we wrote code that was smart enough to avoid the error (1)
+       by broadcasting its inputs to the same rank before concatenating them.
+       Then given an `x` of structured rank `[2, 1]`, the output
+       `y = b2.forward(x)` would have structured rank `[2, 2]`, and its inverse
+       `b2.inverse(y)` would *also* have structured rank `[2, 2]`. That is, `b2`
+       (and by extension `c2`) would no longer be a bijection on `x`. Using it
+       to transform a distribution with events of structured rank `[2, 1]` would
+       break the `log_prob` method, since the base distribution would be
+       presented with values of unexpected structured rank, and log det
+       Jacobians would also be incorrect due to internal broadcasting.
+
+    Note that the `parts_interact` property is all-or-nothing; there is
+    currently no way to specify a interaction between some-but-not-all parts.
+    This may lead to overly-conservative min_event_ndims inference in some
+    cases.
+    """
+    # Assume that multipart bijectors involve interactions unless they
+    # override this method to say otherwise.
+    return (tf.nest.is_nested(self.forward_min_event_ndims) or
+            tf.nest.is_nested(self.inverse_min_event_ndims))
+
+  @property
   def validate_args(self):
     """Returns True if Tensor arguments will be validated."""
     return self._validate_args
@@ -643,8 +817,7 @@ class Bijector(tf.Module):
     # Remove "self", "__class__", or other special variables. These can appear
     # if the subclass used:
     # `parameters = dict(locals())`.
-    return {k: v for k, v in self._parameters.items()
-            if not k.startswith('__') and k != 'self'}
+    return self._parameters
 
   def __hash__(self):
     return hash(cache_util.hashable_structure((
@@ -668,8 +841,12 @@ class Bijector(tf.Module):
         continue
       if tf.is_tensor(p1):
         p1 = tf.get_static_value(p1)
+        if p1 is None:
+          return False
       if tf.is_tensor(p2):
         p2 = tf.get_static_value(p2)
+        if p2 is None:
+          return False
       p1_isarray = getattr(p1, '__array__', None) is not None
       p2_isarray = getattr(p2, '__array__', None) is not None
       if p1_isarray != p2_isarray:
@@ -684,6 +861,11 @@ class Bijector(tf.Module):
     return True
 
   def _get_parameterization(self):
+    if self.parameters is None:
+      # If a user-written bijector doesn't specify `parameters`, we must assume
+      # that all instances are unique.
+      # TODO(b/176242804): this can be removed if we always infer `parameters`.
+      return id(self)
     return self.parameters
 
   def __call__(self, value, name=None, **kwargs):
@@ -713,14 +895,14 @@ class Bijector(tf.Module):
 
     ```python
     sigmoid = tfb.Reciprocal()(
-        tfb.AffineScalar(shift=1.)(
+        tfb.Shift(shift=1.)(
           tfb.Exp()(
-            tfb.AffineScalar(scale=-1.))))
+            tfb.Scale(scale=-1.))))
     # ==> `tfb.Chain([
     #         tfb.Reciprocal(),
-    #         tfb.AffineScalar(shift=1.),
+    #         tfb.Shift(shift=1.),
     #         tfb.Exp(),
-    #         tfb.AffineScalar(scale=-1.),
+    #         tfb.Scale(scale=-1.),
     #      ])`  # ie, `tfb.Sigmoid()`
 
     log_normal = tfb.Exp()(tfd.Normal(0, 1))
@@ -772,6 +954,28 @@ class Bijector(tf.Module):
       return chain.Chain([self, value], name=name, **kwargs)
 
     return self.forward(value, name=name or 'forward', **kwargs)
+
+  def copy(self, **override_parameters_kwargs):
+    """Creates a copy of the bijector.
+
+    Note: the copy bijector may continue to depend on the original
+    initialization arguments.
+
+    Args:
+      **override_parameters_kwargs: String/value dictionary of initialization
+        arguments to override with new values.
+
+    Returns:
+      bijector: A new instance of `type(self)` initialized from the union
+        of self.parameters and override_parameters_kwargs, i.e.,
+        `dict(self.parameters, **override_parameters_kwargs)`.
+    """
+    parameters = dict(self.parameters, **override_parameters_kwargs)
+    b = type(self)(**parameters)
+    # pylint: disable=protected-access
+    b._parameters = self._no_dependency(parameters)
+    # pylint: enable=protected-access
+    return b
 
   def _forward_event_shape_tensor(self, input_shape):
     """Subclass implementation for `forward_event_shape_tensor` function."""
@@ -899,6 +1103,193 @@ class Bijector(tf.Module):
         self.forward_min_event_ndims, tf.TensorShape,
         self._inverse_event_shape(output_shape))
 
+  def _get_x_event_ndims(self, x_event_ndims=None, y_event_ndims=None):
+    if x_event_ndims is None:
+      if y_event_ndims is not None:
+        x_event_ndims = self.inverse_event_ndims(y_event_ndims)
+      else:  # Default to `min_event_ndims` if not explicitly specified.
+        return self.forward_min_event_ndims
+    elif y_event_ndims is not None:
+      raise ValueError(
+          'Only one of `x_event_ndims` and `y_event_ndims` may be specified.')
+    return x_event_ndims
+
+  def _batch_shape(self, x_event_ndims):
+    if not self._params_event_ndims():
+      # Skip requirement for a unique difference in event ndims if this bijector
+      # wouldn't have batch shape anyway.
+      return tensorshape_util.constant_value_as_shape([])
+
+    # Infer batch shape from annotations returned by `_parameter_properties()`.
+    # Batch shape inference assumes that the provided and minimum event ndims
+    # differ by the same amount in all parts. Bijectors with multiple
+    # independent parts will need to override this method, or inherit from a
+    # class (such as Composition) that does so.
+    return batch_shape_lib.inferred_batch_shape(
+        self,
+        additional_event_ndims=_unique_difference(x_event_ndims,
+                                                  self.forward_min_event_ndims))
+
+  def experimental_batch_shape(self, x_event_ndims=None, y_event_ndims=None):
+    """Returns the batch shape of this bijector for inputs of the given rank.
+
+    The batch shape of a bijector decribes the set of distinct
+    transformations it represents on events of a given size. For example: the
+    bijector `tfb.Scale([1., 2.])` has batch shape `[2]` for scalar events
+    (`event_ndims = 0`), because applying it to a scalar event produces
+    two scalar outputs, the result of two different scaling transformations.
+    The same bijector has batch shape `[]` for vector events, because applying
+    it to a vector produces (via elementwise multiplication) a single vector
+    output.
+
+    Bijectors that operate independently on multiple state parts, such as
+    `tfb.JointMap`, must broadcast to a coherent batch shape. Some events may
+    not be valid: for example, the bijector
+    `tfd.JointMap([tfb.Scale([1., 2.]), tfb.Scale([1., 2., 3.])])` does not
+    produce a valid batch shape when `event_ndims = [0, 0]`, since the batch
+    shapes of the two parts are inconsistent. The same bijector
+    does define valid batch shapes of `[]`, `[2]`, and `[3]` if `event_ndims`
+    is `[1, 1]`, `[0, 1]`, or `[1, 0]`, respectively.
+
+    Since transforming a single event produces a scalar log-det-Jacobian, the
+    batch shape of a bijector with non-constant Jacobian is expected to equal
+    the shape of `forward_log_det_jacobian(x, event_ndims=x_event_ndims)`
+    or `inverse_log_det_jacobian(y, event_ndims=y_event_ndims)`, for `x`
+    or `y` of the specified `ndims`.
+
+    Args:
+      x_event_ndims: Optional Python `int` (structure) number of dimensions in
+        a probabilistic event passed to `forward`; this must be greater than
+        or equal to `self.forward_min_event_ndims`. If `None`, defaults to
+        `self.forward_min_event_ndims`. Mutually exclusive with `y_event_ndims`.
+        Default value: `None`.
+      y_event_ndims: Optional Python `int` (structure) number of dimensions in
+        a probabilistic event passed to `inverse`; this must be greater than
+        or equal to `self.inverse_min_event_ndims`. Mutually exclusive with
+        `x_event_ndims`.
+        Default value: `None`.
+    Returns:
+      batch_shape: `TensorShape` batch shape of this bijector for a
+        value with the given event rank. May be unknown or partially defined.
+    """
+    x_event_ndims = self._get_x_event_ndims(x_event_ndims, y_event_ndims)
+    # Cache batch shape to avoid the overhead of recomputing it.
+    if not hasattr(self, '_cached_batch_shapes'):
+      self._cached_batch_shapes = self._no_dependency({})
+    key = _deep_tuple(x_event_ndims)  # Avoid hashing lists/dicts.
+    if key not in self._cached_batch_shapes:
+      self._cached_batch_shapes[key] = self._batch_shape(x_event_ndims)
+    return self._cached_batch_shapes[key]
+
+  def _batch_shape_tensor(self, x_event_ndims):
+    if not self._params_event_ndims():
+      # Skip requirement for a unique difference in event ndims if this bijector
+      # wouldn't have batch shape anyway.
+      return []
+
+    # Infer batch shape from annotations returned by `_parameter_properties()`.
+    # Batch shape inference assumes that the provided and minimum event ndims
+    # differ by the same amount in all parts. Bijectors with multiple
+    # independent parts will need to override this method, or inherit from a
+    # class (such as Composition) that does so.
+    return batch_shape_lib.inferred_batch_shape_tensor(
+        self, additional_event_ndims=_unique_difference(
+            x_event_ndims, self.forward_min_event_ndims))
+
+  def experimental_batch_shape_tensor(self,
+                                      x_event_ndims=None,
+                                      y_event_ndims=None):
+    """Returns the batch shape of this bijector for inputs of the given rank.
+
+    The batch shape of a bijector decribes the set of distinct
+    transformations it represents on events of a given size. For example: the
+    bijector `tfb.Scale([1., 2.])` has batch shape `[2]` for scalar events
+    (`event_ndims = 0`), because applying it to a scalar event produces
+    two scalar outputs, the result of two different scaling transformations.
+    The same bijector has batch shape `[]` for vector events, because applying
+    it to a vector produces (via elementwise multiplication) a single vector
+    output.
+
+    Bijectors that operate independently on multiple state parts, such as
+    `tfb.JointMap`, must broadcast to a coherent batch shape. Some events may
+    not be valid: for example, the bijector
+    `tfd.JointMap([tfb.Scale([1., 2.]), tfb.Scale([1., 2., 3.])])` does not
+    produce a valid batch shape when `event_ndims = [0, 0]`, since the batch
+    shapes of the two parts are inconsistent. The same bijector
+    does define valid batch shapes of `[]`, `[2]`, and `[3]` if `event_ndims`
+    is `[1, 1]`, `[0, 1]`, or `[1, 0]`, respectively.
+
+    Since transforming a single event produces a scalar log-det-Jacobian, the
+    batch shape of a bijector with non-constant Jacobian is expected to equal
+    the shape of `forward_log_det_jacobian(x, event_ndims=x_event_ndims)`
+    or `inverse_log_det_jacobian(y, event_ndims=y_event_ndims)`, for `x`
+    or `y` of the specified `ndims`.
+
+    Args:
+      x_event_ndims: Optional Python `int` (structure) number of dimensions in
+        a probabilistic event passed to `forward`; this must be greater than
+        or equal to `self.forward_min_event_ndims`. If `None`, defaults to
+        `self.forward_min_event_ndims`. Mutually exclusive with `y_event_ndims`.
+        Default value: `None`.
+      y_event_ndims: Optional Python `int` (structure) number of dimensions in
+        a probabilistic event passed to `inverse`; this must be greater than
+        or equal to `self.inverse_min_event_ndims`. Mutually exclusive with
+        `x_event_ndims`.
+        Default value: `None`.
+    Returns:
+      batch_shape_tensor: integer `Tensor` batch shape of this bijector for a
+        value with the given event rank.
+    """
+    with tf.name_scope('experimental_batch_shape_tensor'):
+      x_event_ndims = self._get_x_event_ndims(x_event_ndims, y_event_ndims)
+      # Try to get the static batch shape.
+      batch_shape = self.experimental_batch_shape(x_event_ndims=x_event_ndims)
+      if not tensorshape_util.is_fully_defined(batch_shape):
+        batch_shape = self._batch_shape_tensor(x_event_ndims)
+      return batch_shape
+
+  @classmethod
+  def _parameter_properties(cls, dtype):
+    raise NotImplementedError(
+        '_parameter_properties` is not implemented: {}'.format(cls.__name__))
+
+  @classmethod
+  def parameter_properties(cls, dtype=tf.float32):
+    """Returns a dict mapping constructor arg names to property annotations.
+
+    This dict should include an entry for each of the bijector's
+    `Tensor`-valued constructor arguments.
+
+    Args:
+      dtype: Optional float `dtype` to assume for continuous-valued parameters.
+        Some constraining bijectors require advance knowledge of the dtype
+        because certain constants (e.g., `tfb.Softplus.low`) must be
+        instantiated with the same dtype as the values to be transformed.
+    Returns:
+      parameter_properties: A
+        `str -> `tfp.python.internal.parameter_properties.ParameterProperties`
+        dict mapping constructor argument names to `ParameterProperties`
+        instances.
+    """
+    with tf.name_scope('parameter_properties'):
+      return cls._parameter_properties(dtype)
+
+  @classmethod
+  def _params_event_ndims(cls):
+    """Returns a dict mapping constructor argument names to per-event rank.
+
+    The ranks are pulled from `cls.parameter_properties()`; this is a
+    convenience wrapper.
+
+    Returns:
+      params_event_ndims: Per-event parameter ranks, a `str->int dict`.
+    """
+    return {
+        param_name: param.event_ndims
+        for param_name, param in cls.parameter_properties().items()
+        if param.event_ndims is not None
+    }
+
   def _forward(self, x):
     """Subclass implementation for `forward` public function."""
     raise NotImplementedError('forward not implemented.')
@@ -1018,11 +1409,6 @@ class Bijector(tf.Module):
       ildj: the inverse log det jacobian at `y`. Also updates the cache as
         needed.
     """
-    if not self.has_static_min_event_ndims:
-      raise NotImplementedError(
-          'Subclasses without static `inverse_min_event_ndims` must override '
-          '`_call_inverse_log_det_jacobian`.')
-
     with self._name_and_control_scope(name):
       dtype = self.forward_dtype(**kwargs)
       y = nest_util.convert_to_nested_tensor(
@@ -1030,13 +1416,16 @@ class Bijector(tf.Module):
           dtype=None if SKIP_DTYPE_CHECKS else dtype,
           allow_packing=True)
 
+      if event_ndims is None:
+        event_ndims = self.inverse_min_event_ndims
+
       reduce_shape, assertions = ldj_reduction_shape(
           nest.map_structure(ps.shape, y),
           event_ndims=nest_util.coerce_structure(
               self.inverse_min_event_ndims, event_ndims),
           min_event_ndims=self._inverse_min_event_ndims,
           parameter_batch_shape=self._parameter_batch_shape,
-          allow_event_shape_broadcasting=self._allow_event_shape_broadcasting,
+          allow_event_shape_broadcasting=not self._parts_interact,
           validate_args=self.validate_args)
 
       # Make sure we have validated reduce_shape before continuing on.
@@ -1045,7 +1434,8 @@ class Bijector(tf.Module):
           # Non-injective bijectors don't use caching, and the resulting
           # LDJ is a tuple of LDJ over possible partitions on `x`.
           return tuple(
-              self._reduce_jacobian_det_over_shape(ildj, reduce_shape)
+              reduce_jacobian_det_over_shape(
+                  ildj, reduce_shape, sum_fn=self._sum_fn)
               for ildj in self._inverse_log_det_jacobian(y, **kwargs))
 
         # Make sure the unreduced ILDJ is in the cache.
@@ -1058,17 +1448,34 @@ class Bijector(tf.Module):
           x = self.inverse(y, **kwargs)  # Fall back to computing `-fldj(x)`
           ildj = attrs['ildj'] = -self._forward_log_det_jacobian(x, **kwargs)
         elif self._is_scalar:
-          ildj = _autodiff_log_det_jacobian(self._inverse, y)
+          try:
+            scalar_batch_shape = self.experimental_batch_shape_tensor(
+                y_event_ndims=0)
+          except NotImplementedError:
+            raise NotImplementedError(
+                'Cannot derive `inverse_log_det_jacobian` using automatic '
+                'differentiation because its shape could not be determined. '
+                'Please implement at least one of:\n'
+                '`{bijector_type}._parameter_properties`\n'
+                '`{bijector_type}._batch_shape_tensor`\n'
+                '`{bijector_type}._forward_log_det_jacobian`\n '
+                '`{bijector_type}._inverse_log_det_jacobian`.'.format(
+                    bijector_type=type(self).__name__))
+          ildj = _autodiff_log_det_jacobian(
+              self.inverse,
+              tf.broadcast_to(y, ps.broadcast_shape(ps.shape(y),
+                                                    scalar_batch_shape)))
         else:
           raise NotImplementedError(
               'Neither _forward_log_det_jacobian nor _inverse_log_det_jacobian '
               'is implemented. One or the other is required.')
 
-        return self._reduce_jacobian_det_over_shape(ildj, reduce_shape)
+        return reduce_jacobian_det_over_shape(
+            ildj, reduce_shape, sum_fn=self._sum_fn)
 
   def inverse_log_det_jacobian(self,
                                y,
-                               event_ndims,
+                               event_ndims=None,
                                name='inverse_log_det_jacobian',
                                **kwargs):
     """Returns the (log o det o Jacobian o inverse)(y).
@@ -1081,15 +1488,19 @@ class Bijector(tf.Module):
     Args:
       y: `Tensor` (structure). The input to the 'inverse' Jacobian determinant
         evaluation.
-      event_ndims: Number of dimensions in the probabilistic events being
-        transformed. Must be greater than or equal to
-        `self.inverse_min_event_ndims`. The result is summed over the final
-        dimensions to produce a scalar Jacobian determinant for each event, i.e.
-        it has shape `rank(y) - event_ndims` dimensions.
-        Multipart bijectors require *structured* event_ndims, such that
-        `rank(y[i]) - rank(event_ndims[i])` is the same for all elements `i` of
-        the structured input. Furthermore, the first `event_ndims[i]` of each
-        `x[i].shape` must be the same for all `i` (broadcasting is not allowed).
+      event_ndims: Optional number of dimensions in the probabilistic events
+        being transformed; this must be greater than or equal to
+        `self.inverse_min_event_ndims`. If `event_ndims` is specified, the
+        log Jacobian determinant is summed to produce a
+        scalar log-determinant for each event. Otherwise
+        (if `event_ndims` is `None`), no reduction is performed.
+        Multipart bijectors require *structured* event_ndims, such that the
+        batch rank `rank(y[i]) - event_ndims[i]` is the same for all
+        elements `i` of the structured input. In most cases (with the
+        exception of `tfb.JointMap`) they further require that
+        `event_ndims[i] - self.inverse_min_event_ndims[i]` is the same for
+        all elements `i` of the structured input.
+        Default value: `None` (equivalent to `self.inverse_min_event_ndims`).
       name: The name to give this op.
       **kwargs: Named arguments forwarded to subclass implementation.
 
@@ -1102,6 +1513,7 @@ class Bijector(tf.Module):
     Raises:
       TypeError: if `x`'s dtype is incompatible with the expected inverse-dtype.
       NotImplementedError: if `_inverse_log_det_jacobian` is not implemented.
+      ValueError: if the value of `event_ndims` is not valid for this bijector.
     """
     return self._call_inverse_log_det_jacobian(y, event_ndims, name, **kwargs)
 
@@ -1131,11 +1543,6 @@ class Bijector(tf.Module):
           'forward_log_det_jacobian cannot be implemented for non-injective '
           'transforms.')
 
-    if not self.has_static_min_event_ndims:
-      raise NotImplementedError(
-          'Subclasses without static `forward_min_event_ndims` must override '
-          '`_call_forward_log_det_jacobian`.')
-
     with self._name_and_control_scope(name):
       dtype = self.inverse_dtype(**kwargs)
       x = nest_util.convert_to_nested_tensor(
@@ -1143,13 +1550,16 @@ class Bijector(tf.Module):
           dtype=None if SKIP_DTYPE_CHECKS else dtype,
           allow_packing=True)
 
+      if event_ndims is None:
+        event_ndims = self.forward_min_event_ndims
+
       reduce_shape, assertions = ldj_reduction_shape(
           nest.map_structure(ps.shape, x),
           event_ndims=nest_util.coerce_structure(
               self.forward_min_event_ndims, event_ndims),
           min_event_ndims=self._forward_min_event_ndims,
           parameter_batch_shape=self._parameter_batch_shape,
-          allow_event_shape_broadcasting=self._allow_event_shape_broadcasting,
+          allow_event_shape_broadcasting=not self._parts_interact,
           validate_args=self.validate_args)
 
       # Make sure we have validated reduce_shape before continuing on.
@@ -1164,17 +1574,34 @@ class Bijector(tf.Module):
           y = self.forward(x, **kwargs)  # Fall back to computing `ildj(y)`
           ildj = attrs['ildj'] = self._inverse_log_det_jacobian(y, **kwargs)
         elif self._is_scalar:
-          ildj = -_autodiff_log_det_jacobian(self._forward, x)
+          try:
+            scalar_batch_shape = self.experimental_batch_shape_tensor(
+                x_event_ndims=0)
+          except NotImplementedError:
+            raise NotImplementedError(
+                'Cannot derive `forward_log_det_jacobian` using automatic '
+                'differentiation because its shape could not be determined. '
+                'Please implement at least one of:\n'
+                '`{bijector_type}._parameter_properties`\n'
+                '`{bijector_type}._batch_shape_tensor`\n'
+                '`{bijector_type}._forward_log_det_jacobian`\n '
+                '`{bijector_type}._inverse_log_det_jacobian`.'.format(
+                    bijector_type=type(self).__name__))
+          ildj = -_autodiff_log_det_jacobian(
+              self.forward,
+              tf.broadcast_to(x, ps.broadcast_shape(ps.shape(x),
+                                                    scalar_batch_shape)))
         else:
           raise NotImplementedError(
               'Neither _forward_log_det_jacobian nor _inverse_log_det_jacobian '
               'is implemented. One or the other is required.')
 
-        return self._reduce_jacobian_det_over_shape(-ildj, reduce_shape)
+        return reduce_jacobian_det_over_shape(
+            -ildj, reduce_shape, sum_fn=self._sum_fn)
 
   def forward_log_det_jacobian(self,
                                x,
-                               event_ndims,
+                               event_ndims=None,
                                name='forward_log_det_jacobian',
                                **kwargs):
     """Returns both the forward_log_det_jacobian.
@@ -1182,15 +1609,19 @@ class Bijector(tf.Module):
     Args:
       x: `Tensor` (structure). The input to the 'forward' Jacobian determinant
         evaluation.
-      event_ndims: Number of dimensions in the probabilistic events being
-        transformed. Must be greater than or equal to
-        `self.forward_min_event_ndims`. The result is summed over the final
-        dimensions to produce a scalar Jacobian determinant for each event, i.e.
-        it has shape `rank(x) - event_ndims` dimensions.
-        Multipart bijectors require *structured* event_ndims, such that
-        `rank(y[i]) - rank(event_ndims[i])` is the same for all elements `i` of
-        the structured input. Furthermore, the first `event_ndims[i]` of each
-        `x[i].shape` must be the same for all `i` (broadcasting is not allowed).
+      event_ndims: Optional number of dimensions in the probabilistic events
+        being transformed; this must be greater than or equal to
+        `self.forward_min_event_ndims`. If `event_ndims` is specified, the
+        log Jacobian determinant is summed to produce a
+        scalar log-determinant for each event. Otherwise
+        (if `event_ndims` is `None`), no reduction is performed.
+        Multipart bijectors require *structured* event_ndims, such that the
+        batch rank `rank(y[i]) - event_ndims[i]` is the same for all
+        elements `i` of the structured input. In most cases (with the
+        exception of `tfb.JointMap`) they further require that
+        `event_ndims[i] - self.inverse_min_event_ndims[i]` is the same for
+        all elements `i` of the structured input.
+        Default value: `None` (equivalent to `self.forward_min_event_ndims`).
       name: The name to give this op.
       **kwargs: Named arguments forwarded to subclass implementation.
 
@@ -1203,6 +1634,7 @@ class Bijector(tf.Module):
       NotImplementedError: if neither `_forward_log_det_jacobian`
         nor {`_inverse`, `_inverse_log_det_jacobian`} are implemented, or
         this is a non-injective bijector.
+      ValueError: if the value of `event_ndims` is not valid for this bijector.
     """
     return self._call_forward_log_det_jacobian(x, event_ndims, name, **kwargs)
 
@@ -1218,7 +1650,7 @@ class Bijector(tf.Module):
     """Returns the dtype returned by `forward` for the provided input."""
     with tf.name_scope('{}/{}'.format(self.name, name)):
       if dtype is UNSPECIFIED:
-        # We pass the the broadcasted input structure through `_forward_dtype`
+        # We pass the broadcasted input structure through `_forward_dtype`
         # rather than directly returning the output structure, allowing
         # subclasses to alter results based on `**kwargs`.
         input_dtype = nest_util.broadcast_structure(
@@ -1247,7 +1679,7 @@ class Bijector(tf.Module):
     """Returns the dtype returned by `inverse` for the provided input."""
     with tf.name_scope('{}/{}'.format(self.name, name)):
       if dtype is UNSPECIFIED:
-        # We pass the the broadcasted output structure through `_inverse_dtype`
+        # We pass the broadcasted output structure through `_inverse_dtype`
         # rather than directly returning the input structure, allowing
         # subclasses to alter results based on `**kwargs`.
         output_dtype = nest_util.broadcast_structure(
@@ -1274,10 +1706,6 @@ class Bijector(tf.Module):
 
   def forward_event_ndims(self, event_ndims, **kwargs):
     """Returns the number of event dimensions produced by `forward`."""
-    if not self.has_static_min_event_ndims:
-      raise NotImplementedError(
-          'Subclasses without static min_event_ndims must override '
-          '`forward_event_ndims`')
     ldj_reduce_ndims = ldj_reduction_ndims(
         nest_util.coerce_structure(self.forward_min_event_ndims, event_ndims),
         self._forward_min_event_ndims)
@@ -1287,10 +1715,6 @@ class Bijector(tf.Module):
 
   def inverse_event_ndims(self, event_ndims, **kwargs):
     """Returns the number of event dimensions produced by `inverse`."""
-    if not self.has_static_min_event_ndims:
-      raise NotImplementedError(
-          'Subclasses without static min_event_ndims must override '
-          '`inverse_event_ndims`')
     ldj_reduce_ndims = ldj_reduction_ndims(
         nest_util.coerce_structure(self.inverse_min_event_ndims, event_ndims),
         self._inverse_min_event_ndims)
@@ -1303,24 +1727,17 @@ class Bijector(tf.Module):
     """Helper function to standardize op scope."""
     with tf.name_scope(self.name):
       with tf.name_scope(name) as name_scope:
-        deps = tuple(
-            d for d in (  # pylint: disable=g-complex-comprehension
-                tuple(self._initial_parameter_control_dependencies) +
-                tuple(self._parameter_control_dependencies(is_init=False)))
-            if d is not None)
+        deps = []
+        if self._defer_all_assertions:
+          deps.extend(self._parameter_control_dependencies(is_init=True))
+        else:
+          deps.extend(self._initial_parameter_control_dependencies)
+        deps.extend(self._parameter_control_dependencies(is_init=False))
         if not deps:
           yield name_scope
           return
         with tf.control_dependencies(deps) as deps_scope:
           yield deps_scope
-
-  def _reduce_jacobian_det_over_shape(self, unreduced, reduce_shape):
-    """Reduce LDJ over the rightmost `reduce_shape.ndims` dimensions."""
-    # Broadcast LDJ to the reduce shape (in case of is_constant_jacobian)
-    # and reduce over the trailing dimensions.
-    ones = tf.ones(reduce_shape, unreduced.dtype)
-    reduce_dims = ps.range(-ps.size(reduce_shape), 0)
-    return tf.reduce_sum(ones * unreduced, axis=reduce_dims)
 
   def _parameter_control_dependencies(self, is_init):
     """Returns a list of ops to be executed in members with graph deps.
@@ -1358,13 +1775,18 @@ class Bijector(tf.Module):
     identifies the keys of parameters that are expected to be tensors, except
     those that are shape-related.
     """
-    pnames = ()
-    for p in self.parameters.keys():
-      if p in self._composite_tensor_shape_params:
-        continue
-      if tf.is_tensor(getattr(self, p, None)):
-        pnames += (p,)
-    return pnames
+    try:
+      return tuple(k for k, v in self.parameter_properties().items()
+                   if not v.specifies_shape)
+    except NotImplementedError:
+      # Attempt to find parameters heuristically.
+      pnames = ()
+      for p in self.parameters.keys():
+        if p in self._composite_tensor_shape_params:
+          continue
+        if tf.is_tensor(getattr(self, p, None)):
+          pnames += (p,)
+      return pnames
 
   @property
   def _composite_tensor_shape_params(self):
@@ -1377,7 +1799,52 @@ class Bijector(tf.Module):
     tensors, so that they can be collected appropriately in CompositeTensor but
     not in JAX applications.
     """
-    return ()
+    try:
+      return tuple(k for k, v in self.parameter_properties().items()
+                   if v.specifies_shape)
+    except NotImplementedError:
+      return ()
+
+  def _sum_fn(self, x, axis=None):
+    if self._use_kahan_sum:
+      return math_generic.reduce_kahan_sum(x, axis=axis).total
+    else:
+      return tf.reduce_sum(x, axis=axis)
+
+
+class _AutoCompositeTensorBijectorMeta(_BijectorMeta):
+  """Metaclass for `AutoCompositeTensorBijector`."""
+
+  def __new__(mcs, classname, baseclasses, attrs):  # pylint: disable=bad-mcs-classmethod-argument
+    """Give subclasses their own type_spec, not an inherited one."""
+
+    cls = super(_AutoCompositeTensorBijectorMeta, mcs).__new__(  # pylint: disable=too-many-function-args
+        mcs, classname, baseclasses, attrs)
+    return auto_composite_tensor.auto_composite_tensor(
+        cls,
+        omit_kwargs=('parameters',),
+        non_identifying_kwargs=('name',),
+        module_name='tfp.bijectors')
+
+
+class AutoCompositeTensorBijector(
+    Bijector, auto_composite_tensor.AutoCompositeTensor,
+    metaclass=_AutoCompositeTensorBijectorMeta):
+  r"""Base for `CompositeTensor` bijectors with auto-generated `TypeSpec`s.
+
+  `CompositeTensor` objects are able to pass in and out of `tf.function` and
+  `tf.while_loop`, or serve as part of the signature of a TF saved model.
+  `Bijector` subclasses that follow the contract of
+  `tfp.experimental.auto_composite_tensor` may be defined as `CompositeTensor`s
+  by inheriting from `AutoCompositeTensorBijector`:
+
+  ```python
+  class MyBijector(tfb.AutoCompositeTensorBijector):
+
+    # The remainder of the subclass implementation is unchanged.
+  ```
+  """
+  pass
 
 
 def check_valid_ndims(ndims, validate=True):
@@ -1615,7 +2082,7 @@ def ldj_reduction_shape(shape_structure,
     if reduce_ndims_ is not None:
       if reduce_ndims_ < 0:
         raise ValueError('`event_ndims must be at least {}. Saw: {}.'
-                         .format(event_ndims, min_event_ndims))
+                         .format(min_event_ndims, event_ndims))
     elif validate_args:
       with tf.control_dependencies(assertions):
         assertions.append(
@@ -1687,11 +2154,11 @@ def ldj_reduction_shape(shape_structure,
           parameter_batch_in_ldj_shape_ = parameter_batch_shape_
         else:
           parameter_batch_in_ldj_shape_ = parameter_batch_shape_[
-              -reduce_ndims_:]
+              ps.rank_from_shape(parameter_batch_shape_) - reduce_ndims_:]
         broadcasted_shape_ = tf.broadcast_static_shape(
             tf.TensorShape(parameter_batch_in_ldj_shape_),
             tf.TensorShape(ldj_reduce_shape_))
-        if not np.all(ldj_reduce_shape_ == broadcasted_shape_):
+        if not np.array_equal(ldj_reduce_shape_, broadcasted_shape_):
           raise ValueError('Broadcasting with bijector parameters changes the '
                            'LDJ reduction shape from {} to {}.'.format(
                                ldj_reduce_shape_, broadcasted_shape_))
@@ -1713,10 +2180,42 @@ def ldj_reduction_shape(shape_structure,
     return ldj_reduce_shape, assertions
 
 
+def reduce_jacobian_det_over_shape(unreduced,
+                                   reduce_shape,
+                                   sum_fn):
+  """Reduce LDJ over the rightmost `reduce_shape.ndims` dimensions."""
+  # Broadcast LDJ to the reduce shape (in case of is_constant_jacobian)
+  # and reduce over the trailing dimensions.
+  ones = tf.ones(reduce_shape, unreduced.dtype)
+  reduce_dims = ps.range(-ps.size(reduce_shape), 0)
+  return sum_fn(ones * unreduced, axis=reduce_dims)
+
+
 def _autodiff_log_det_jacobian(fn, x):
   """Automatically compute the log det jacobian of a scalar function."""
+  # Note: x must be fully broadcast (`shape(x) == shape(fn(x))`); otherwise
+  # the gradients will be (incorrectly) summed.
   _, grads = gradient.value_and_gradient(fn, x)
   if grads is None:
     raise ValueError('Cannot compute log det jacobian; function {} has `None` '
                      'gradient.'.format(fn))
   return tf.math.log(tf.abs(grads))
+
+
+def _unique_difference(structure1, structure2):
+  differences = [a - b
+                 for a, b in
+                 zip(tf.nest.flatten(structure1), tf.nest.flatten(structure2))]
+  if all([d == differences[0] for d in differences]):
+    return differences[0]
+  raise ValueError('Could not find unique difference between {} and {}'
+                   .format(structure1, structure2))
+
+
+def _deep_tuple(x):
+  """Converts nested `tuple`, `list`, or `dict` to nested `tuple`."""
+  if hasattr(x, 'keys'):
+    return _deep_tuple(tuple(x.items()))
+  elif isinstance(x, (list, tuple)):
+    return tuple(map(_deep_tuple, x))
+  return x

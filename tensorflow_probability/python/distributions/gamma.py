@@ -22,6 +22,7 @@ from __future__ import print_function
 import numpy as np
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python import math as tfp_math
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
 from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import kullback_leibler
@@ -45,7 +46,7 @@ __all__ = [
 ]
 
 
-class Gamma(distribution.Distribution):
+class Gamma(distribution.AutoCompositeTensorDistribution):
   """Gamma distribution.
 
   The Gamma distribution is defined over positive real numbers using
@@ -130,6 +131,7 @@ class Gamma(distribution.Distribution):
                log_rate=None,
                validate_args=False,
                allow_nan_stats=True,
+               force_probs_to_zero_outside_support=False,
                name='Gamma'):
     """Construct Gamma with `concentration` and `rate` parameters.
 
@@ -152,12 +154,16 @@ class Gamma(distribution.Distribution):
         (e.g., mean, mode, variance) use the value "`NaN`" to indicate the
         result is undefined. When `False`, an exception is raised if one or
         more of the statistic's batch members are undefined.
+      force_probs_to_zero_outside_support: If `True`, force `prob(x) == 0` and
+        `log_prob(x) == -inf` for values of x outside the distribution support.
       name: Python `str` name prefixed to Ops created by this class.
 
     Raises:
       TypeError: if `concentration` and `rate` are different dtypes.
     """
     parameters = dict(locals())
+    self._force_probs_to_zero_outside_support = (
+        force_probs_to_zero_outside_support)
     if (rate is None) == (log_rate is None):
       raise ValueError('Exactly one of `rate` or `log_rate` must be specified.')
     with tf.name_scope(name) as name:
@@ -207,16 +213,9 @@ class Gamma(distribution.Distribution):
     """Log-rate parameter."""
     return self._log_rate
 
-  def _batch_shape_tensor(self, concentration=None, rate=None):
-    return ps.broadcast_shape(
-        ps.shape(
-            self.concentration if concentration is None else concentration),
-        _shape_or_scalar(self.rate, self.log_rate))
-
-  def _batch_shape(self):
-    return tf.broadcast_static_shape(
-        self.concentration.shape,
-        _tensorshape_or_scalar(self.rate, self.log_rate))
+  @property
+  def force_probs_to_zero_outside_support(self):
+    return self._force_probs_to_zero_outside_support
 
   def _event_shape_tensor(self):
     return tf.constant([], dtype=tf.int32)
@@ -261,12 +260,19 @@ class Gamma(distribution.Distribution):
       log_rate = tf.math.log(rate)
     log_unnormalized_prob = tf.math.xlogy(concentration - 1., x) - rate * x
     log_normalization = tf.math.lgamma(concentration) - concentration * log_rate
-    return log_unnormalized_prob - log_normalization
+    lp = log_unnormalized_prob - log_normalization
+    if self.force_probs_to_zero_outside_support:
+      return tf.where(x >= 0, lp, -float('inf'))
+    return lp
 
   def _cdf(self, x):
     # Note that igamma returns the regularized incomplete gamma function,
     # which is what we want for the CDF.
-    return tf.math.igamma(self.concentration, self._rate_parameter() * x)
+    cdf = tf.math.igamma(self.concentration, self._rate_parameter() * x)
+    return distribution_util.extend_cdf_outside_support(x, cdf, low=0.)
+
+  def _quantile(self, p):
+    return tfp_math.igammainv(self.concentration, p) / self._rate_parameter()
 
   def _entropy(self):
     concentration = tf.convert_to_tensor(self.concentration)
@@ -384,7 +390,7 @@ def _tensorshape_or_scalar(v0, v1):
 def _random_gamma_cpu(
     shape, concentration, rate=None, log_rate=None, seed=None, log_space=False):
   """Sample using *fast* `tf.random.stateless_gamma`."""
-  bad_concentration = (concentration <= 0.) | tf.math.is_nan(concentration)
+  bad_concentration = (concentration < 0.) | tf.math.is_nan(concentration)
   safe_concentration = tf.where(
       bad_concentration,
       dtype_util.as_numpy_dtype(concentration.dtype)(100.), concentration)
@@ -468,7 +474,7 @@ def _random_gamma_no_gradient(
     concentration: Concentration of gamma distribution.
     rate: Rate parameter of gamma distribution.
     log_rate: Log-rate parameter of gamma distribution.
-    seed: int or Tensor seed.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
     log_space: If `True`, draw log-of-gamma samples.
 
   Returns:
@@ -541,12 +547,12 @@ def _random_gamma_fwd(shape, concentration, rate, log_rate, seed, log_space):
   samples, impl = _random_gamma_no_gradient(
       shape, concentration, rate, log_rate, seed, log_space)
   return ((samples, impl),
-          (samples, shape, concentration, rate, log_rate, log_space))
+          (samples, concentration, rate, log_rate))
 
 
-def _random_gamma_bwd(aux, g):
+def _random_gamma_bwd(shape, log_space, aux, g):
   """The gradient of the gamma samples."""
-  samples, shape, concentration, rate, log_rate, log_space = aux
+  samples, concentration, rate, log_rate = aux
   dsamples, dimpl = g
   # Ignore any gradient contributions that come from the implementation enum.
   del dimpl
@@ -682,7 +688,7 @@ def _random_gamma_rejection(
     log_rate: Floating point tensor, log of the inverse scale params of the
       distribution(s). Must broadcast with `concentration`. If `None`, handled
       as if 0 (but possibly more efficiently). Mutually exclusive with `rate`.
-    seed: (optional) The random seed.
+    seed: PRNG seed; see `tfp.random.sanitize_seed` for details.
     log_space: Optionally sample log(gamma) variates.
     internal_dtype: dtype to use for internal computations. If unspecified, we
       use the same dtype as the output (i.e. the dtype of `concentration`,
@@ -711,7 +717,7 @@ def _random_gamma_rejection(
     # Note, concentration here already has a shape that is broadcast with rate.
     cast_concentration = tf.cast(concentration, internal_dtype)
 
-    good_params_mask = (concentration > 0.)
+    good_params_mask = (concentration >= 0.)
     # When replacing NaN values, use 100. for concentration, since that leads to
     # a high-likelihood of the rejection sampler accepting on the first pass.
     safe_concentration = tf.where(good_params_mask, cast_concentration, 100.)

@@ -25,8 +25,8 @@ from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.math import bessel as tfp_math
+from tensorflow_probability.python.math.psd_kernels import positive_semidefinite_kernel as psd_kernel
 from tensorflow_probability.python.math.psd_kernels.internal import util
-from tensorflow_probability.python.math.psd_kernels.positive_semidefinite_kernel import PositiveSemidefiniteKernel
 
 __all__ = [
     'GeneralizedMatern',
@@ -111,7 +111,9 @@ class _AmplitudeLengthScaleMixin(object):
         example_ndims=(x1_example_ndims + x2_example_ndims))
 
 
-class GeneralizedMatern(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
+@psd_kernel.auto_composite_tensor_psd_kernel
+class GeneralizedMatern(_AmplitudeLengthScaleMixin,
+                        psd_kernel.AutoCompositeTensorPsdKernel):
   """Generalized Matern Kernel.
 
   This kernel parameterizes the Matern family of kernels.
@@ -196,8 +198,8 @@ class GeneralizedMatern(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
     log_result = tf.where(
         tf.math.equal(norm, 0.),
         dtype_util.as_numpy_dtype(self.dtype)(0.),
-        df * tf.math.log(safe_norm) + tf.math.log(
-            tfp_math.bessel_kve(df, safe_norm)) - safe_norm)
+        df * tf.math.log(safe_norm) + tfp_math.log_bessel_kve(
+            df, safe_norm) - safe_norm)
 
     log_result = log_result - tf.math.lgamma(df) + (1. - df) * np.log(2.)
 
@@ -224,7 +226,9 @@ class GeneralizedMatern(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
     return assertions
 
 
-class MaternOneHalf(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
+@psd_kernel.auto_composite_tensor_psd_kernel
+class MaternOneHalf(_AmplitudeLengthScaleMixin,
+                    psd_kernel.AutoCompositeTensorPsdKernel):
   """Matern Kernel with parameter 1/2.
 
   This kernel is part of the Matern family of kernels, with parameter 1/2.
@@ -235,7 +239,7 @@ class MaternOneHalf(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
   The kernel has the following form:
 
   ```none
-    k(x, y) = amplitude**2  * exp(-||x - y|| / length_scale)
+    k(x, y) = amplitude ** 2  * exp(-||x - y|| / length_scale)
   ```
 
   where the double-bars represent vector length (i.e. Euclidean, or L2 Norm).
@@ -295,14 +299,16 @@ class MaternOneHalf(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
     return tf.exp(log_result)
 
 
-class MaternThreeHalves(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
+@psd_kernel.auto_composite_tensor_psd_kernel
+class MaternThreeHalves(_AmplitudeLengthScaleMixin,
+                        psd_kernel.AutoCompositeTensorPsdKernel):
   """Matern Kernel with parameter 3/2.
 
   This kernel is part of the Matern family of kernels, with parameter 3/2.
 
   ```none
     z = sqrt(3) * ||x - y|| / length_scale
-    k(x, y) = (1 + z) * exp(-z)
+    k(x, y) = amplitude ** 2 * (1 + z) * exp(-z)
   ```
 
   where the double-bars represent vector length (i.e. Euclidean, or L2 Norm).
@@ -363,14 +369,16 @@ class MaternThreeHalves(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
     return tf.exp(log_result)
 
 
-class MaternFiveHalves(_AmplitudeLengthScaleMixin, PositiveSemidefiniteKernel):
+@psd_kernel.auto_composite_tensor_psd_kernel
+class MaternFiveHalves(_AmplitudeLengthScaleMixin,
+                       psd_kernel.AutoCompositeTensorPsdKernel):
   """Matern 5/2 Kernel.
 
   This kernel is part of the Matern family of kernels, with parameter 5/2.
 
   ```none
     z = sqrt(5) * ||x - y|| / length_scale
-    k(x, y) = (1 + z + (z ** 2) / 3) * exp(-z)
+    k(x, y) = amplitude ** 2 * (1 + z + (z ** 2) / 3) * exp(-z)
   ```
 
   where the double-bars represent vector length (i.e. Euclidean, or L2 Norm).

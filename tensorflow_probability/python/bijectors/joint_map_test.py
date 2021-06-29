@@ -23,6 +23,7 @@ from __future__ import print_function
 import numpy as np
 import tensorflow.compat.v2 as tf
 from tensorflow_probability.python import bijectors as tfb
+from tensorflow_probability.python.bijectors import ldj_ratio
 from tensorflow_probability.python.internal import test_util
 
 
@@ -123,6 +124,112 @@ class JointMapBijectorTest(test_util.TestCase):
         event_ndims=dict.fromkeys('abc', 0))
     self.assertDTypeEqual(fldj, np.float64)
     self.assertAllClose(np.log(1) + np.log(2) + np.log(3), self.evaluate(fldj))
+
+  def test_inverse_has_event_ndims(self):
+    bij_reshape = tfb.Invert(tfb.JointMap([tfb.Reshape([])]))
+    bij_reshape.inverse_event_ndims([10])  # expect [9]
+    self.assertEqual(bij_reshape.inverse_event_ndims([10]), [9])
+
+  @test_util.disable_test_for_backend(
+      disable_numpy=True, disable_jax=True,
+      reason='Numpy and JAX have no notion of CompositeTensor/saved_model.')
+  def testCompositeTensor(self):
+    exp = tfb.Exp()
+    sp = tfb.Softplus()
+    aff = tfb.Scale(scale=2.)
+    bij = tfb.JointMap(bijectors=[exp, sp, aff])
+    self.assertIsInstance(bij, tf.__internal__.CompositeTensor)
+
+    # Bijector may be flattened into `Tensor` components and rebuilt.
+    flat = tf.nest.flatten(bij, expand_composites=True)
+    unflat = tf.nest.pack_sequence_as(bij, flat, expand_composites=True)
+    self.assertIsInstance(unflat, tfb.JointMap)
+
+    # Bijector may be input to a `tf.function`-decorated callable.
+    @tf.function
+    def call_forward(bij, x):
+      return bij.forward(x)
+
+    x = [1., 2., 3.]
+    self.assertAllClose(call_forward(unflat, x), bij.forward(x))
+
+    # Type spec can be encoded/decoded.
+    struct_coder = tf.__internal__.saved_model.StructureCoder()
+    enc = struct_coder.encode_structure(bij._type_spec)
+    dec = struct_coder.decode_proto(enc)
+    self.assertEqual(bij._type_spec, dec)
+
+  def testNonCompositeTensor(self):
+
+    # TODO(b/182603117): Move NonComposite* into test_util.
+    class NonCompositeScale(tfb.Bijector):
+      """Bijector that is not a `CompositeTensor`."""
+
+      def __init__(self, scale):
+        parameters = dict(locals())
+        self.scale = scale
+        super(NonCompositeScale, self).__init__(
+            validate_args=True,
+            forward_min_event_ndims=0.,
+            parameters=parameters,
+            name='non_composite_scale')
+
+      def _forward(self, x):
+        return x * self.scale
+
+    exp = tfb.Exp()
+    scale = NonCompositeScale(scale=tf.constant(3.))
+    bij = tfb.JointMap(bijectors=[exp, scale])
+    self.assertNotIsInstance(bij, tf.__internal__.CompositeTensor)
+    self.assertAllClose(
+        bij.forward([1., 1.]),
+        [exp.forward(1.), scale.forward(1.)])
+
+  def testLDJRatio(self):
+    q = tfb.JointMap({
+        'a': tfb.Exp(),
+        'b': tfb.Scale(2.),
+        'c': tfb.Shift(3.)
+    })
+    p = tfb.JointMap({
+        'a': tfb.Exp(),
+        'b': tfb.Scale(3.),
+        'c': tfb.Shift(4.)
+    })
+
+    a = np.asarray([[[1, 2], [2, 3]]], dtype=np.float32)   # shape=[1, 2, 2]
+    b = np.asarray([[0, 4]], dtype=np.float32)             # shape=[1, 2]
+    c = np.asarray([[5, 6]], dtype=np.float32)             # shape=[1, 2]
+
+    x = {'a': a, 'b': b, 'c': c}
+    y = {'a': a + 1, 'b': b + 1, 'c': c + 1}
+    event_ndims = {'a': 1, 'b': 0, 'c': 0}
+
+    fldj_ratio_true = p.forward_log_det_jacobian(
+        x, event_ndims) - q.forward_log_det_jacobian(y, event_ndims)
+    fldj_ratio = ldj_ratio.forward_log_det_jacobian_ratio(
+        p, x, q, y, event_ndims)
+    self.assertAllClose(fldj_ratio_true, fldj_ratio)
+
+    ildj_ratio_true = p.inverse_log_det_jacobian(
+        x, event_ndims) - q.inverse_log_det_jacobian(y, event_ndims)
+    ildj_ratio = ldj_ratio.inverse_log_det_jacobian_ratio(
+        p, x, q, y, event_ndims)
+    self.assertAllClose(ildj_ratio_true, ildj_ratio)
+
+    event_ndims = {'a': 1, 'b': 2, 'c': 0}
+
+    fldj_ratio_true = p.forward_log_det_jacobian(
+        x, event_ndims) - q.forward_log_det_jacobian(y, event_ndims)
+    fldj_ratio = ldj_ratio.forward_log_det_jacobian_ratio(
+        p, x, q, y, event_ndims)
+    self.assertAllClose(fldj_ratio_true, fldj_ratio)
+
+    ildj_ratio_true = p.inverse_log_det_jacobian(
+        x, event_ndims) - q.inverse_log_det_jacobian(y, event_ndims)
+    ildj_ratio = ldj_ratio.inverse_log_det_jacobian_ratio(
+        p, x, q, y, event_ndims)
+    self.assertAllClose(ildj_ratio_true, ildj_ratio)
 
 
 if __name__ == '__main__':

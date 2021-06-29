@@ -34,7 +34,10 @@ import tensorflow_probability as tfp
 
 from tensorflow_probability.python import bijectors as tfb
 from tensorflow_probability.python import distributions as tfd
+from tensorflow_probability.python.internal import distribute_lib
+from tensorflow_probability.python.internal import distribute_test_lib
 from tensorflow_probability.python.internal import prefer_static as ps
+from tensorflow_probability.python.internal import samplers
 from tensorflow_probability.python.internal import tensorshape_util
 from tensorflow_probability.python.internal import test_util
 from tensorflow_probability.python.mcmc.hmc import _compute_log_acceptance_correction
@@ -173,9 +176,9 @@ class HMCTest(test_util.TestCase):
         1, 'Estimated E[x, exp(x)]: {}\t{}'.format(actual_x, actual_exp_x))
     self.assertAllClose(actual_x, expected_x_, atol=.045, rtol=0.)
     self.assertAllClose(actual_exp_x, expected_exp_x, atol=.02, rtol=0.)
-    self.assertAllEqual(np.ones_like(acceptance_probs, np.bool),
+    self.assertAllEqual(np.ones_like(acceptance_probs, np.bool_),
                         acceptance_probs > 0.5)
-    self.assertAllEqual(np.ones_like(acceptance_probs, np.bool),
+    self.assertAllEqual(np.ones_like(acceptance_probs, np.bool_),
                         acceptance_probs <= 1.)
 
   def _chain_gets_correct_expectations_wrapper(self, independent_chain_ndims):
@@ -638,6 +641,56 @@ class HMCTest(test_util.TestCase):
     # Also ensure eval doesn't crash things.
     self.evaluate(r0)
 
+  def testDynamicStepSizeWorks(self):
+    if tf.executing_eagerly() or JAX_MODE:
+      raise self.skipTest(
+          'Dynamic step size makes no sense in Eager or JAX modes.')
+
+    true_mean = 0.0
+    true_var = 1.0
+    num_results = 200
+
+    def target_log_prob(x):
+      return -x**2 / 2.
+
+    step_size_ = 0.4456789
+    step_size_ph = tf1.placeholder_with_default(step_size_, shape=None)
+
+    def trace_fn(_, pkr):
+      return {
+          'accept_prob':
+              tf.exp(tf.minimum(pkr.log_accept_ratio, 0.)),
+          'step_size':
+              pkr.accepted_results.step_size,
+      }
+
+    states, trace = tfp.mcmc.sample_chain(
+        num_results=num_results,
+        current_state=0.123,
+        kernel=tfp.mcmc.HamiltonianMonteCarlo(
+            target_log_prob_fn=target_log_prob,
+            step_size=step_size_ph,
+            num_leapfrog_steps=5,
+            store_parameters_in_results=True,
+        ),
+        num_burnin_steps=20,
+        trace_fn=trace_fn,
+        seed=test_util.test_seed())
+
+    states_, trace_ = self.evaluate([states, trace])
+
+    self.assertAllClose(trace_['step_size'], step_size_ * np.ones(
+        (num_results)))
+
+    # Basic sanity checks. It would be very strange if dynamic step size made
+    # these checks fail.
+    mean_accept = np.mean(trace_['accept_prob'])
+    self.assertGreater(mean_accept, 0.7, msg='Bad sampling')
+    self.assertAllClose(
+        np.mean(states_), true_mean, atol=10 / np.sqrt(num_results))
+    self.assertAllClose(
+        np.var(states_), true_var, rtol=10 / np.sqrt(num_results))
+
 
 class _LogCorrectionTest(object):
 
@@ -679,7 +732,7 @@ class _LogCorrectionTest(object):
 
     # Ensure gradient is finite.
     self.assertAllEqual(
-        np.ones_like(actual_grads_target_log_prob_, dtype=np.bool),
+        np.ones_like(actual_grads_target_log_prob_, dtype=np.bool_),
         np.isfinite(actual_grads_target_log_prob_))
 
   def testHandlesNanFromKinetic(self):
@@ -710,12 +763,12 @@ class _LogCorrectionTest(object):
 
     # Ensure gradient is finite.
     g = grads_[0].reshape([len(x), len(x)])[:, 0]
-    self.assertAllEqual(np.ones_like(g, dtype=np.bool), np.isfinite(g))
+    self.assertAllEqual(np.ones_like(g, dtype=np.bool_), np.isfinite(g))
 
     # The remaining gradients are nan because the momentum was itself nan or
     # inf.
     g = grads_[0].reshape([len(x), len(x)])[:, 1:]
-    self.assertAllEqual(np.ones_like(g, dtype=np.bool), np.isnan(g))
+    self.assertAllEqual(np.ones_like(g, dtype=np.bool_), np.isnan(g))
 
 
 @test_util.test_all_tf_execution_regimes
@@ -1000,7 +1053,7 @@ class HMCEMAdaptiveStepSize(test_util.TestCase):
           sigma.pretransformed_input
       ]])
 
-      weights_prior_estimated_scale = tf.identity(sigma)
+      weights_prior_estimated_scale = tf.convert_to_tensor(sigma)
       return (weights_prior_estimated_scale, weights[-1], loss,
               step_size[-1], avg_acceptance_ratio)
 
@@ -1110,6 +1163,118 @@ class ReproducibleFromSeedTest(test_util.TestCase):
     # Check that the results are the same
     self.assertAllClose(state, states[n])
     self.assertAllAssertsNested(self.assertAllClose, kr, tr_n)
+
+
+@test_util.test_all_tf_execution_regimes
+class DistributedHMCTest(distribute_test_lib.DistributedTest):
+
+  def test_hmc_kernel_tracks_axis_names(self):
+    kernel = tfp.mcmc.HamiltonianMonteCarlo(tfd.Normal(0, 1).log_prob,
+                                            step_size=1.9,
+                                            num_leapfrog_steps=2)
+    self.assertIsNone(kernel.experimental_shard_axis_names)
+    kernel = tfp.mcmc.HamiltonianMonteCarlo(tfd.Normal(0, 1).log_prob,
+                                            step_size=1.9,
+                                            num_leapfrog_steps=2,
+                                            experimental_shard_axis_names=['a'])
+    self.assertListEqual(kernel.experimental_shard_axis_names, ['a'])
+    kernel = tfp.mcmc.HamiltonianMonteCarlo(
+        tfd.Normal(0, 1).log_prob, step_size=1.9,
+        num_leapfrog_steps=2).experimental_with_shard_axes(['a'])
+    self.assertListEqual(kernel.experimental_shard_axis_names, ['a'])
+
+  def test_hmc_kernel_samples_correct_momenta_for_sharded_state(self):
+
+    if not JAX_MODE:
+      self.skipTest('Test in TF runs into `merge_call` error: see b/178944108')
+
+    def target_log_prob(a, b):
+      dist = tfd.Normal(0., 1.)
+      return dist.log_prob(a) + dist.log_prob(b)
+
+    kernel = tfp.mcmc.HamiltonianMonteCarlo(target_log_prob,
+                                            step_size=1.9,
+                                            num_leapfrog_steps=2)
+    sharded_kernel = kernel.experimental_with_shard_axes([None, ['foo']])
+    def run(seed):
+      state = [0., 0.]
+      kr = sharded_kernel.bootstrap_results(state)
+      _, kr = sharded_kernel.one_step(state, kr, seed=seed)
+      return kr.proposed_results.initial_momentum
+
+    momentum = self.evaluate(self.per_replica_to_tensor(
+        self.strategy_run(run, args=(samplers.zeros_seed(),),
+                          in_axes=None, axis_name='foo'), 0))
+
+    # Unsharded state momenta should all be equal
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      self.assertAllClose(momentum[0][i], momentum[0][0])
+    # Sharded state momenta should be different
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      for j in range(distribute_test_lib.NUM_DEVICES):
+        if i == j:
+          continue
+        self.assertNotAllClose(momentum[1][i], momentum[1][j])
+
+  def test_computes_same_log_acceptance_correction_with_sharded_state(self):
+
+    if not JAX_MODE:
+      self.skipTest('Test in TF runs into `merge_call` error: see b/178944108')
+
+    def target_log_prob(a, b):
+      return (
+          tfd.Normal(0., 1.).log_prob(a)
+          + distribute_lib.psum(tfd.Normal(
+              distribute_lib.pbroadcast(a, 'foo'), 1.).log_prob(b), 'foo'))
+
+    kernel = tfp.mcmc.HamiltonianMonteCarlo(target_log_prob,
+                                            step_size=1.9,
+                                            num_leapfrog_steps=2)
+    sharded_kernel = kernel.experimental_with_shard_axes([None, ['foo']])
+
+    def run(seed):
+      state = [0., 0.]
+      kr = sharded_kernel.bootstrap_results(state)
+      _, kr = sharded_kernel.one_step(state, kr, seed=seed)
+      return kr.proposed_results.log_acceptance_correction
+
+    log_acceptance_correction = self.evaluate(self.per_replica_to_tensor(
+        self.strategy_run(run, args=(samplers.zeros_seed(),),
+                          in_axes=None, axis_name='foo'), 0))
+
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      self.assertAllClose(log_acceptance_correction[i],
+                          log_acceptance_correction[0])
+
+  def test_unsharded_state_remains_synchronized_across_devices(self):
+
+    if not JAX_MODE:
+      self.skipTest('Test in TF runs into `merge_call` error: see b/178944108')
+
+    def target_log_prob(a, b):
+      return (
+          tfd.Normal(0., 1.).log_prob(a)
+          + distribute_lib.psum(tfd.Normal(
+              distribute_lib.pbroadcast(a, 'foo'), 1.).log_prob(b), 'foo'))
+
+    kernel = tfp.mcmc.HamiltonianMonteCarlo(target_log_prob,
+                                            step_size=1e-1,
+                                            num_leapfrog_steps=2)
+    sharded_kernel = kernel.experimental_with_shard_axes([None, ['foo']])
+
+    def run(seed):
+      state = [-10., -10.]
+      kr = sharded_kernel.bootstrap_results(state)
+      state, _ = sharded_kernel.one_step(state, kr, seed=seed)
+      return state
+
+    state = self.evaluate(self.per_replica_to_tensor(
+        self.strategy_run(run, args=(samplers.zeros_seed(),),
+                          in_axes=None, axis_name='foo'), 0))
+
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      self.assertAllClose(state[0][i],
+                          state[0][0])
 
 
 if __name__ == '__main__':

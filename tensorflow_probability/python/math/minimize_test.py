@@ -53,6 +53,16 @@ class MinimizeTests(test_util.TestCase):
     self.assertAllClose(results_['x'][-1], target_x, atol=0.2)
     self.assertAllClose(results_['sqdiff'][-1], [0., 0.], atol=0.1)
 
+  def test_can_trace_all_traceable_quantities(self):
+    x = tf.Variable(5.0)
+    trace_fn = lambda traceable_quantities: traceable_quantities
+    results = tfp.math.minimize(loss_fn=lambda: tf.reduce_sum((x - 1.0)**2),
+                                num_steps=10,
+                                optimizer=tf.optimizers.Adam(0.1),
+                                trace_fn=trace_fn)
+    self.evaluate(tf1.global_variables_initializer())
+    self.evaluate(results)
+
   def test_respects_trainable_variables(self):
     # Variables not included in `trainable_variables` should stay fixed.
     x = tf.Variable(5.)
@@ -232,10 +242,16 @@ class MinimizeTests(test_util.TestCase):
     # whether it is executing in an XLA context.
     using_xla, not_using_xla = 42., -9999.
     def xla_detecting_loss_fn():
-      control_flow_context = tf1.get_default_graph()._control_flow_context
-      if (control_flow_context is not None and
-          control_flow_context.IsXLAContext()):
-        return using_xla + (x - x)  # Refer to `x` to ensure loss is trainable.
+      # Search the graph hierarchy for an XLA context.
+      graph = tf1.get_default_graph()
+      while True:
+        if (graph._control_flow_context is not None and
+            graph._control_flow_context.IsXLAContext()):
+          return using_xla + (x - x)  # Refer to `x` to ensure gradient.
+        try:
+          graph = graph.outer_graph
+        except AttributeError:
+          break
       return not_using_xla + (x - x)
 
     xla_losses = tfp.math.minimize(
@@ -264,6 +280,24 @@ class MinimizeTests(test_util.TestCase):
     losses_ = self.evaluate(losses)
     # Final loss should be lower than initial loss.
     self.assertAllGreater(losses_[0], losses_[-1])
+
+  def test_deterministic_results_with_seed(self):
+    stochastic_loss_fn = lambda seed: tf.random.stateless_normal([], seed=seed)
+    optimizer = tf.optimizers.SGD(1e-3)
+    seed = test_util.test_seed(sampler_type='stateless')
+    losses1 = self.evaluate(
+        tfp.math.minimize(loss_fn=stochastic_loss_fn,
+                          num_steps=10,
+                          optimizer=optimizer,
+                          seed=seed))
+    losses2 = self.evaluate(
+        tfp.math.minimize(loss_fn=stochastic_loss_fn,
+                          num_steps=10,
+                          optimizer=optimizer,
+                          seed=seed))
+    self.assertAllEqual(losses1, losses2)
+    # Make sure we got different samples at each step.
+    self.assertAllGreater(tf.abs(losses1[1:] - losses1[:-1]), 1e-4)
 
 if __name__ == '__main__':
   tf.test.main()

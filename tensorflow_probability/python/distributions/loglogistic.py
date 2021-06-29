@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""LogNormal distribution classes."""
+"""LogLogistic distribution classes."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -23,6 +23,7 @@ import tensorflow.compat.v2 as tf
 
 from tensorflow_probability.python.bijectors import exp as exp_bijector
 from tensorflow_probability.python.bijectors import softplus as softplus_bijector
+from tensorflow_probability.python.distributions import distribution
 from tensorflow_probability.python.distributions import logistic
 from tensorflow_probability.python.distributions import transformed_distribution
 from tensorflow_probability.python.internal import assert_util
@@ -34,7 +35,10 @@ __all__ = [
 ]
 
 
-class LogLogistic(transformed_distribution.TransformedDistribution):
+# TODO(b/182603117): Remove `AutoCompositeTensor` subclass when
+# `TransformedDistribution` is converted to `CompositeTensor`.
+class LogLogistic(transformed_distribution.TransformedDistribution,
+                  distribution.AutoCompositeTensorDistribution):
   """The log-logistic distribution."""
 
   def __init__(self,
@@ -46,12 +50,12 @@ class LogLogistic(transformed_distribution.TransformedDistribution):
     """Construct a log-logistic distribution.
 
     The LogLogistic distribution models positive-valued random variables
-    whose logarithm is a logistic distribution with loc `loc` and
+    whose logarithm is a logistic distribution with location `loc` and
     scale `scale`. It is constructed as the exponential
     transformation of a Logistic distribution.
 
     Args:
-      loc: Floating-point `Tensor`; the loc of the underlying logistic
+      loc: Floating-point `Tensor`; the location of the underlying logistic
         distribution(s).
       scale: Floating-point `Tensor`; the scale of the underlying logistic
         distribution(s).
@@ -93,6 +97,8 @@ class LogLogistic(transformed_distribution.TransformedDistribution):
   def scale(self):
     """Distribution parameter of the underlying distribution."""
     return self.distribution.scale
+
+  experimental_is_sharded = False
 
   def _mean(self):
     scale = tf.convert_to_tensor(self.scale)
@@ -137,8 +143,14 @@ class LogLogistic(transformed_distribution.TransformedDistribution):
     scale = tf.convert_to_tensor(self.scale)
     loc = tf.convert_to_tensor(self.loc)
     log_z = self._log_z(x, loc=loc, scale=scale)
-    return (-tf.math.log(scale) - loc +
-            (1. - scale) * log_z - 2 * tf.math.softplus(log_z))
+    answer = (-tf.math.log(scale) - loc +
+              (1. - scale) * log_z - 2 * tf.math.softplus(log_z))
+    # The formula computes `nan` for `x == +inf`.  However, it shouldn't be too
+    # inaccurate for large finite `x`, because `x` only appears as `log(x)`, and
+    # `log` is effectively discountinuous at `+inf`.
+    return tf.where(x >= np.inf,
+                    tf.constant(-np.inf, dtype=answer.dtype),
+                    answer)
 
   def _log_cdf(self, x):
     return -tf.math.softplus(-self._log_z(x))
@@ -160,7 +172,7 @@ class LogLogistic(transformed_distribution.TransformedDistribution):
 
 
 def sinc(x, name=None):
-  """Calculate the (normalized) sinus cardinal of x."""
+  """Calculate the (normalized) sinus cardinalis of x."""
   name = name or 'sinc'
   with tf.name_scope(name):
     x *= np.pi

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for RandomWalkMetropolisNormal and RandomWalkMetropolisUniform."""
+"""Tests for RandomWalkMetropolis."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -21,10 +21,16 @@ from __future__ import print_function
 # Dependency imports
 
 import numpy as np
+import tensorflow.compat.v1 as tf1
 import tensorflow.compat.v2 as tf
 import tensorflow_probability as tfp
 from tensorflow_probability.python import distributions as tfd
+from tensorflow_probability.python.internal import distribute_lib
+from tensorflow_probability.python.internal import distribute_test_lib
+from tensorflow_probability.python.internal import samplers
 from tensorflow_probability.python.internal import test_util
+
+JAX_MODE = False
 
 
 @test_util.test_all_tf_execution_regimes
@@ -71,6 +77,37 @@ class RWMTest(test_util.TestCase):
     sample_std = tf.math.reduce_std(samples, axis=(0, 1))
 
     [sample_mean_, sample_std_] = self.evaluate([sample_mean, sample_std])
+
+    self.assertAllClose(0., sample_mean_, atol=0.2, rtol=0.)
+    self.assertAllClose(1., sample_std_, atol=0.2, rtol=0.)
+
+  def testRWM1DNormalWithDynamicScaleForNextState(self):
+    """Sampling from the Standard Normal Distribution with adaptation."""
+    if tf.executing_eagerly() or JAX_MODE:
+      raise self.skipTest(
+          'Dynamic scale makes no sense in Eager or JAX modes.')
+
+    scale_ph = tf1.placeholder_with_default(1.0, shape=None)
+
+    def target_log_prob(x):
+      return -tf.reduce_sum(x**2) / 2
+
+    samples = tfp.mcmc.sample_chain(
+        num_results=500,
+        current_state=np.float32([0.] * 4),  # 4 parallel chains
+        kernel=tfp.mcmc.RandomWalkMetropolis(
+            target_log_prob,
+            new_state_fn=tfp.mcmc.random_walk_normal_fn(scale_ph),
+        ),
+        num_burnin_steps=500,
+        trace_fn=None,
+        seed=test_util.test_seed(),
+    )
+
+    sample_mean = tf.math.reduce_mean(samples, axis=(0, 1))
+    sample_std = tf.math.reduce_std(samples, axis=(0, 1))
+
+    sample_mean_, sample_std_ = self.evaluate([sample_mean, sample_std])
 
     self.assertAllClose(0., sample_mean_, atol=0.2, rtol=0.)
     self.assertAllClose(1., sample_std_, atol=0.2, rtol=0.)
@@ -167,6 +204,82 @@ class RWMTest(test_util.TestCase):
         target_log_prob_fn=lambda x: -tf.square(x) / 2.,
     )
     self.assertFalse(uncal_rw.is_calibrated)
+
+
+@test_util.test_all_tf_execution_regimes
+class DistributedRWMTest(distribute_test_lib.DistributedTest):
+
+  def test_rwm_kernel_tracks_axis_names(self):
+    kernel = tfp.mcmc.RandomWalkMetropolis(
+        tfd.Normal(0, 1).log_prob)
+    self.assertIsNone(kernel.experimental_shard_axis_names)
+    kernel = tfp.mcmc.RandomWalkMetropolis(
+        tfd.Normal(0, 1).log_prob,
+        experimental_shard_axis_names=['a'])
+    self.assertListEqual(kernel.experimental_shard_axis_names, ['a'])
+    kernel = tfp.mcmc.RandomWalkMetropolis(
+        tfd.Normal(0, 1).log_prob,
+    ).experimental_with_shard_axes(['a'])
+    self.assertListEqual(kernel.experimental_shard_axis_names, ['a'])
+
+  @test_util.numpy_disable_test_missing_functionality('No SPMD support.')
+  def test_computes_same_log_acceptance_correction_with_sharded_state(self):
+
+    if not JAX_MODE:
+      self.skipTest('Test in TF runs into `merge_call` error: see b/178944108')
+
+    def target_log_prob(a, b):
+      return (
+          tfd.Normal(0., 1.).log_prob(a)
+          + distribute_lib.psum(tfd.Normal(
+              distribute_lib.pbroadcast(a, 'foo'), 1.).log_prob(b), 'foo'))
+
+    kernel = tfp.mcmc.RandomWalkMetropolis(target_log_prob)
+    sharded_kernel = kernel.experimental_with_shard_axes([None, ['foo']])
+
+    def run(seed):
+      state = [tf.convert_to_tensor(0.), tf.convert_to_tensor(0.)]
+      kr = sharded_kernel.bootstrap_results(state)
+      _, kr = sharded_kernel.one_step(state, kr, seed=seed)
+      return kr.proposed_results.log_acceptance_correction
+
+    log_acceptance_correction = self.evaluate(self.per_replica_to_tensor(
+        self.strategy_run(run, args=(samplers.zeros_seed(),),
+                          in_axes=None, axis_name='foo'), 0))
+
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      self.assertAllClose(log_acceptance_correction[i],
+                          log_acceptance_correction[0])
+
+  @test_util.numpy_disable_test_missing_functionality('No SPMD support.')
+  def test_unsharded_state_remains_synchronized_across_devices(self):
+
+    if not JAX_MODE:
+      self.skipTest('Test in TF runs into `merge_call` error: see b/178944108')
+
+    def target_log_prob(a, b):
+      return (
+          tfd.Normal(0., 1.).log_prob(a)
+          + distribute_lib.psum(tfd.Normal(
+              distribute_lib.pbroadcast(a, 'foo'), 1.).log_prob(b), 'foo'))
+
+    kernel = tfp.mcmc.RandomWalkMetropolis(target_log_prob)
+    sharded_kernel = kernel.experimental_with_shard_axes([None, ['foo']])
+
+    def run(seed):
+      state = [tf.convert_to_tensor(-10.),
+               tf.convert_to_tensor(-10.)]
+      kr = sharded_kernel.bootstrap_results(state)
+      state, _ = sharded_kernel.one_step(state, kr, seed=seed)
+      return state
+
+    state = self.evaluate(self.per_replica_to_tensor(
+        self.strategy_run(run, args=(samplers.zeros_seed(),),
+                          in_axes=None, axis_name='foo'), 0))
+
+    for i in range(distribute_test_lib.NUM_DEVICES):
+      self.assertAllClose(state[0][i],
+                          state[0][0])
 
 
 if __name__ == '__main__':

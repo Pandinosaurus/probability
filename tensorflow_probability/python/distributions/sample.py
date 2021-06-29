@@ -25,11 +25,14 @@ import numpy as np
 
 import tensorflow.compat.v2 as tf
 
+from tensorflow_probability.python import math as tfp_math
 from tensorflow_probability.python.bijectors import bijector as bijector_lib
 from tensorflow_probability.python.distributions import distribution as distribution_lib
 from tensorflow_probability.python.distributions import kullback_leibler
+from tensorflow_probability.python.distributions import log_prob_ratio
 from tensorflow_probability.python.internal import assert_util
 from tensorflow_probability.python.internal import dtype_util
+from tensorflow_probability.python.internal import parameter_properties
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import tensor_util
 from tensorflow_probability.python.internal import tensorshape_util
@@ -121,6 +124,7 @@ class Sample(distribution_lib.Distribution):
       distribution,
       sample_shape=(),
       validate_args=False,
+      experimental_use_kahan_sum=False,
       name=None):
     """Construct the `Sample` distribution.
 
@@ -141,10 +145,16 @@ class Sample(distribution_lib.Distribution):
       validate_args: Python `bool`.  Whether to validate input with asserts.
         If `validate_args` is `False`, and the inputs are invalid,
         correct behavior is not guaranteed.
+      experimental_use_kahan_sum: Python `bool`. When `True`, we use Kahan
+        summation to aggregate independent underlying log_prob values, which
+        improves against the precision of a naive float32 sum. This can be
+        noticeable in particular for large dimensions in float32. See CPU caveat
+        on `tfp.math.reduce_kahan_sum`.
       name: The name for ops managed by the distribution.
         Default value: `None` (i.e., `'Sample' + distribution.name`).
     """
     parameters = dict(locals())
+    self._experimental_use_kahan_sum = experimental_use_kahan_sum
     with tf.name_scope(name or 'Sample' + distribution.name) as name:
       self._distribution = distribution
       self._sample_shape = tensor_util.convert_nonref_to_tensor(
@@ -162,9 +172,19 @@ class Sample(distribution_lib.Distribution):
   def distribution(self):
     return self._distribution
 
+  @classmethod
+  def _parameter_properties(cls, dtype, num_classes=None):
+    return dict(
+        distribution=parameter_properties.BatchedComponentProperties(),
+        sample_shape=parameter_properties.ShapeParameterProperties())
+
   @property
   def sample_shape(self):
     return self._sample_shape
+
+  @property
+  def experimental_is_sharded(self):
+    return self.distribution.experimental_is_sharded
 
   def __getitem__(self, slices):
     # Because slicing is parameterization-dependent, we only implement slicing
@@ -175,12 +195,6 @@ class Sample(distribution_lib.Distribution):
     # Since this distribution only modifies the event shape, we can simply pass
     # through slicing to the underlying.
     return self.copy(distribution=self.distribution.__getitem__(slices))
-
-  def _batch_shape_tensor(self):
-    return self.distribution.batch_shape_tensor()
-
-  def _batch_shape(self):
-    return self.distribution.batch_shape
 
   def _event_shape_tensor(self):
     return ps.concat([
@@ -200,30 +214,38 @@ class Sample(distribution_lib.Distribution):
     return tensorshape_util.concatenate(sample_shape,
                                         self.distribution.event_shape)
 
-  def _sample_n(self, n, seed, **kwargs):
-    sample_shape = ps.reshape(self.sample_shape, shape=[-1])
-    fake_sample_ndims = ps.rank_from_shape(sample_shape)
+  def _sampling_permutation(self, sample_ndims):
+    fake_sample_ndims = ps.rank_from_shape(
+        ps.reshape(self.sample_shape, shape=[-1]))
     event_ndims = ps.rank_from_shape(
         self.distribution.event_shape_tensor, self.distribution.event_shape)
     batch_ndims = ps.rank_from_shape(
         self.distribution.batch_shape_tensor, self.distribution.batch_shape)
-    perm = ps.concat([
-        [0],
-        ps.range(1 + fake_sample_ndims,
-                 1 + fake_sample_ndims + batch_ndims,
+    return ps.concat([
+        ps.range(sample_ndims),
+        ps.range(sample_ndims + fake_sample_ndims,
+                 sample_ndims + fake_sample_ndims + batch_ndims,
                  dtype=tf.int32),
-        ps.range(1, 1 + fake_sample_ndims, dtype=tf.int32),
-        ps.range(1 + fake_sample_ndims + batch_ndims,
-                 1 + fake_sample_ndims + batch_ndims + event_ndims,
+        ps.range(sample_ndims, sample_ndims + fake_sample_ndims,
+                 dtype=tf.int32),
+        ps.range(sample_ndims + fake_sample_ndims + batch_ndims,
+                 sample_ndims + fake_sample_ndims + batch_ndims + event_ndims,
                  dtype=tf.int32),
     ], axis=0)
-    x = self.distribution.sample(
-        ps.concat([[n], sample_shape], axis=0),
-        seed=seed,
-        **kwargs)
-    return tf.transpose(a=x, perm=perm)
 
-  def _log_prob(self, x, **kwargs):
+  def _sample_n(self, n, seed, **kwargs):
+    sample_shape = ps.reshape(self.sample_shape, shape=[-1])
+    x = self.distribution.sample(ps.concat([[n], sample_shape], axis=0),
+                                 seed=seed,
+                                 **kwargs)
+    return tf.transpose(a=x, perm=self._sampling_permutation(sample_ndims=1))
+
+  def _sum_fn(self):
+    if self._experimental_use_kahan_sum:
+      return lambda x, axis: tfp_math.reduce_kahan_sum(x, axis).total
+    return tf.math.reduce_sum
+
+  def _prepare_for_underlying(self, x):
     batch_ndims = ps.rank_from_shape(
         self.distribution.batch_shape_tensor,
         self.distribution.batch_shape)
@@ -240,23 +262,14 @@ class Sample(distribution_lib.Distribution):
             ps.shape(x),
             paddings=[[ps.maximum(0, -d), 0]],
             constant_values=1))
-    ndims = ps.rank(x)
     sample_ndims = ps.maximum(0, d)
-    # (2) Transpose x's dims.
-    sample_dims = ps.range(0, sample_ndims)
-    batch_dims = ps.range(sample_ndims, sample_ndims + batch_ndims)
-    extra_sample_dims = ps.range(
-        sample_ndims + batch_ndims,
-        sample_ndims + batch_ndims + extra_sample_ndims)
-    event_dims = ps.range(
-        sample_ndims + batch_ndims + extra_sample_ndims,
-        ndims)
-    perm = ps.concat(
-        [sample_dims, extra_sample_dims, batch_dims, event_dims], axis=0)
-    x = tf.transpose(a=x, perm=perm)
-    # (3) Compute x's log_prob.
-    lp = self.distribution.log_prob(x, **kwargs)
-    # (4) Ensure lp is fully broadcast in the sample dims, i.e. ensure lp has
+    x = tf.transpose(
+        x, perm=ps.invert_permutation(self._sampling_permutation(sample_ndims)))
+    return x, (sample_ndims, extra_sample_ndims, batch_ndims)
+
+  def _finish_log_prob(self, lp, aux):
+    (sample_ndims, extra_sample_ndims, batch_ndims) = aux
+    # (1) Ensure lp is fully broadcast in the sample dims, i.e. ensure lp has
     #     full sample shape in the sample axes, before we reduce.
     bcast_lp_shape = ps.broadcast_shape(
         ps.shape(lp),
@@ -264,9 +277,30 @@ class Sample(distribution_lib.Distribution):
                    ps.reshape(self.sample_shape, shape=[-1]),
                    ps.ones([batch_ndims], tf.int32)], axis=0))
     lp = tf.broadcast_to(lp, bcast_lp_shape)
-    # (5) Make the final reduction in x.
+    # (2) Make the final reduction.
     axis = ps.range(sample_ndims, sample_ndims + extra_sample_ndims)
-    return tf.reduce_sum(lp, axis=axis)
+    return self._sum_fn()(lp, axis=axis)
+
+  def _sample_and_log_prob(self, sample_shape, seed, **kwargs):
+    sample_ndims = ps.rank_from_shape(sample_shape)
+    batch_ndims = ps.rank_from_shape(
+        self.distribution.batch_shape_tensor,
+        self.distribution.batch_shape)
+    extra_sample_shape = ps.reshape(self.sample_shape, shape=[-1])
+    extra_sample_ndims = ps.rank_from_shape(extra_sample_shape)
+    x, lp = self.distribution.experimental_sample_and_log_prob(
+        ps.concat([sample_shape, extra_sample_shape], axis=0), seed=seed,
+        **kwargs)
+    return (
+        tf.transpose(x, perm=self._sampling_permutation(sample_ndims)),
+        self._finish_log_prob(
+            lp, aux=(sample_ndims, extra_sample_ndims, batch_ndims)))
+
+  def _log_prob(self, x, **kwargs):
+    x, aux = self._prepare_for_underlying(x)
+    return self._finish_log_prob(
+        self.distribution.log_prob(x, **kwargs),
+        aux)
 
   def _entropy(self, **kwargs):
     h = self.distribution.entropy(**kwargs)
@@ -282,7 +316,14 @@ class Sample(distribution_lib.Distribution):
     # TODO(b/170405182): In scenarios where we can statically prove that it has
     #   no batch part, avoid the transposes by directly using
     #   `self.distribution.experimental_default_event_space_bijector()`.
-    return _DefaultSampleBijector(self.distribution, self.sample_shape)
+    bijector = self.distribution.experimental_default_event_space_bijector()
+    if bijector is None:
+      return None
+    bijector = _DefaultSampleBijector(
+        self.distribution, self.sample_shape, self._sum_fn(), bijector=bijector)
+    # TODO(b/191803645): Come up with an API to set this.
+    bijector._use_kahan_sum = self._experimental_use_kahan_sum  # pylint: disable=protected-access
+    return bijector
 
   def _parameter_control_dependencies(self, is_init):
     assertions = []
@@ -327,19 +368,18 @@ class Sample(distribution_lib.Distribution):
 
     return assertions
 
-  _composite_tensor_nonshape_params = ('distribution',)
-
-  _composite_tensor_shape_params = ('sample_shape',)
-
 
 class _DefaultSampleBijector(bijector_lib.Bijector):
   """Since tfd.Sample uses transposes, it requires a custom event bijector."""
 
-  def __init__(self, distribution, sample_shape):
+  def __init__(self, distribution, sample_shape, sum_fn, bijector=None):
     parameters = dict(locals())
     self.distribution = distribution
-    self.bijector = distribution.experimental_default_event_space_bijector()
+    if bijector is None:
+      bijector = distribution.experimental_default_event_space_bijector()
+    self.bijector = bijector
     self.sample_shape = sample_shape
+    self._sum_fn = sum_fn
     sample_ndims = ps.rank_from_shape(self.sample_shape)
     super(_DefaultSampleBijector, self).__init__(
         forward_min_event_ndims=(
@@ -466,7 +506,7 @@ class _DefaultSampleBijector(bijector_lib.Bijector):
                    ps.ones([batch_ndims], tf.int32),
                    ps.reshape(self.sample_shape, shape=[-1])], axis=0))
     ldj = tf.broadcast_to(underlying_ldj, bcast_ldj_shape)
-    return tf.reduce_sum(ldj, axis=-1 - ps.range(extra_sample_ndims))
+    return self._sum_fn(ldj, axis=-1 - ps.range(extra_sample_ndims))
 
   def _forward_log_det_jacobian(self, x, **kwargs):
     dist = self.distribution
@@ -529,3 +569,20 @@ def _kl_sample(a, b, name='kl_sample'):
         a.distribution, b.distribution, name=name)
     n = ps.reduce_prod(a.sample_shape)
     return tf.cast(x=n, dtype=kl.dtype) * kl
+
+
+@log_prob_ratio.RegisterLogProbRatio(Sample)
+def _sample_log_prob_ratio(p, x, q, y, name=None):
+  """Implements `log_prob_ratio` for tfd.Sample."""
+  with tf.name_scope(name or 'sample_log_prob_ratio'):
+    checks = []
+    if p.validate_args or q.validate_args:
+      checks.append(tf.debugging.assert_equal(p.sample_shape, q.sample_shape))
+    with tf.control_dependencies(checks):
+      # pylint: disable=protected-access
+      x, aux = p._prepare_for_underlying(x)
+      y, _ = q._prepare_for_underlying(y)
+      return p._finish_log_prob(
+          log_prob_ratio.log_prob_ratio(p.distribution, x, q.distribution, y),
+          aux)
+      # pylint: enable=protected-access

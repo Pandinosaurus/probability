@@ -22,9 +22,7 @@ import collections
 # Dependency imports
 import tensorflow.compat.v2 as tf
 
-from tensorflow_probability.python.distributions import independent
-from tensorflow_probability.python.distributions import joint_distribution_sequential as jds
-from tensorflow_probability.python.distributions import normal
+from tensorflow_probability.python.experimental.mcmc import preconditioning_utils as pu
 from tensorflow_probability.python.internal import prefer_static as ps
 from tensorflow_probability.python.internal import samplers
 from tensorflow_probability.python.mcmc import hmc
@@ -60,8 +58,8 @@ class PreconditionedHamiltonianMonteCarlo(hmc.HamiltonianMonteCarlo):
 
   ##### Simple chain with warm-up.
 
-  In this example we sample from a non-isotropic distribution, and show that
-  we may sample efficiently with HMC by pre-conditioning.
+  In this example we can use an estimate of the target covariance to sample
+  efficiently with HMC.
 
   ```python
   import tensorflow as tf
@@ -159,6 +157,7 @@ class PreconditionedHamiltonianMonteCarlo(hmc.HamiltonianMonteCarlo):
                state_gradients_are_stopped=False,
                step_size_update_fn=None,
                store_parameters_in_results=False,
+               experimental_shard_axis_names=None,
                name=None):
     """Initializes this transition kernel.
 
@@ -176,7 +175,8 @@ class PreconditionedHamiltonianMonteCarlo(hmc.HamiltonianMonteCarlo):
         for. Total progress per HMC step is roughly proportional to
         `step_size * num_leapfrog_steps`.
       momentum_distribution: A `tfp.distributions.Distribution` instance to draw
-        momentum from. Defaults to isotropic normal distributions.
+        momentum from. Defaults to normal distributions with identity
+        covariance.
       state_gradients_are_stopped: Python `bool` indicating that the proposed
         new state be run through `tf.stop_gradient`. This is particularly useful
         when combining optimization over samples from the HMC chain.
@@ -194,8 +194,10 @@ class PreconditionedHamiltonianMonteCarlo(hmc.HamiltonianMonteCarlo):
         `tfp.experimental.as_composite` and `tfp.experimental.auto_composite`.
         This is incompatible with `step_size_update_fn`, which must be set to
         `None`.
+      experimental_shard_axis_names: A structure of string names indicating how
+        members of the state are sharded.
       name: Python `str` name prefixed to Ops created by this function.
-        Default value: `None` (i.e., 'hmc_kernel').
+        Default value: `None` (i.e., 'phmc_kernel').
     """
     if step_size_update_fn and store_parameters_in_results:
       raise ValueError('It is invalid to simultaneously specify '
@@ -208,7 +210,8 @@ class PreconditionedHamiltonianMonteCarlo(hmc.HamiltonianMonteCarlo):
             num_leapfrog_steps=num_leapfrog_steps,
             state_gradients_are_stopped=state_gradients_are_stopped,
             momentum_distribution=momentum_distribution,
-            name=name or 'hmc_kernel',
+            name=name or 'phmc_kernel',
+            experimental_shard_axis_names=experimental_shard_axis_names,
             store_parameters_in_results=store_parameters_in_results))
     self._parameters = self._impl.inner_kernel.parameters.copy()
     self._parameters.pop('seed', None)  # TODO(b/159636942): Remove this line.
@@ -236,6 +239,7 @@ class UncalibratedPreconditionedHamiltonianMonteCarlo(
                momentum_distribution=None,
                state_gradients_are_stopped=False,
                store_parameters_in_results=False,
+               experimental_shard_axis_names=None,
                name=None):
     super(UncalibratedPreconditionedHamiltonianMonteCarlo, self).__init__(
         target_log_prob_fn,
@@ -243,6 +247,7 @@ class UncalibratedPreconditionedHamiltonianMonteCarlo(
         num_leapfrog_steps,
         state_gradients_are_stopped=state_gradients_are_stopped,
         store_parameters_in_results=store_parameters_in_results,
+        experimental_shard_axis_names=experimental_shard_axis_names,
         name=name)
     self._parameters['momentum_distribution'] = momentum_distribution
     self._parameters.pop('seed', None)  # TODO(b/159636942): Remove this line.
@@ -277,21 +282,15 @@ class UncalibratedPreconditionedHamiltonianMonteCarlo(
           previous_kernel_results.target_log_prob,
           previous_kernel_results.grads_target_log_prob,
           maybe_expand=True,
-          state_gradients_are_stopped=self.state_gradients_are_stopped)
+          state_gradients_are_stopped=self.state_gradients_are_stopped,
+          experimental_shard_axis_names=self.experimental_shard_axis_names)
 
       seed = samplers.sanitize_seed(seed)
-      current_momentum_parts = momentum_distribution.sample(seed=seed)
+      current_momentum_parts = list(momentum_distribution.sample(seed=seed))
       momentum_log_prob = getattr(momentum_distribution,
                                   '_log_prob_unnormalized',
                                   momentum_distribution.log_prob)
       kinetic_energy_fn = lambda *args: -momentum_log_prob(*args)
-
-      # Let the integrator handle the case where no momentum distribution
-      # is provided
-      if self.momentum_distribution is None:
-        leapfrog_kinetic_energy_fn = None
-      else:
-        leapfrog_kinetic_energy_fn = kinetic_energy_fn
 
       integrator = leapfrog_impl.SimpleLeapfrogIntegrator(
           self.target_log_prob_fn, step_sizes, num_leapfrog_steps)
@@ -306,7 +305,7 @@ class UncalibratedPreconditionedHamiltonianMonteCarlo(
           current_state_parts,
           target=current_target_log_prob,
           target_grad_parts=current_target_log_prob_grad_parts,
-          kinetic_energy_fn=leapfrog_kinetic_energy_fn)
+          kinetic_energy_fn=kinetic_energy_fn)
       if self.state_gradients_are_stopped:
         next_state_parts = [tf.stop_gradient(x) for x in next_state_parts]
 
@@ -332,11 +331,18 @@ class UncalibratedPreconditionedHamiltonianMonteCarlo(
       result = super(UncalibratedPreconditionedHamiltonianMonteCarlo,
                      self).bootstrap_results(init_state)
 
+      state_parts, _ = mcmc_util.prepare_state_parts(init_state,
+                                                     name='current_state')
+      target_log_prob = self.target_log_prob_fn(*state_parts)
       if (not self._store_parameters_in_results or
           self.momentum_distribution is None):
-        momentum_distribution = []
+        momentum_distribution = pu.make_momentum_distribution(
+            state_parts, ps.shape(target_log_prob),
+            shard_axis_names=self.experimental_shard_axis_names
+        )
       else:
-        momentum_distribution = self.momentum_distribution
+        momentum_distribution = pu.maybe_make_list_and_batch_broadcast(
+            self.momentum_distribution, ps.shape(target_log_prob))
       result = UncalibratedPreconditionedHamiltonianMonteCarloKernelResults(
           **result._asdict(),  # pylint: disable=protected-access
           momentum_distribution=momentum_distribution)
@@ -447,7 +453,8 @@ def _prepare_args(target_log_prob_fn,
                   target_log_prob=None,
                   grads_target_log_prob=None,
                   maybe_expand=False,
-                  state_gradients_are_stopped=False):
+                  state_gradients_are_stopped=False,
+                  experimental_shard_axis_names=None):
   """Helper which processes input args to meet list-like assumptions."""
   state_parts, _ = mcmc_util.prepare_state_parts(state, name='current_state')
   if state_gradients_are_stopped:
@@ -457,26 +464,13 @@ def _prepare_args(target_log_prob_fn,
   step_sizes, _ = mcmc_util.prepare_state_parts(
       step_size, dtype=target_log_prob.dtype, name='step_size')
 
-  # Default momentum distribution is None, but if `store_parameters_in_results`
-  # is true, then `momentum_distribution` defaults to an empty list
-  if momentum_distribution is None or isinstance(momentum_distribution, list):
-    batch_rank = ps.rank(target_log_prob)
-    def _batched_isotropic_normal_like(state_part):
-      event_ndims = ps.rank(state_part) - batch_rank
-      return independent.Independent(
-          normal.Normal(ps.zeros_like(state_part, tf.float32), 1.),
-          reinterpreted_batch_ndims=event_ndims)
-
-    momentum_distribution = jds.JointDistributionSequential(
-        [_batched_isotropic_normal_like(state_part)
-         for state_part in state_parts])
-
-  # The momentum will get "maybe listified" to zip with the state parts,
-  # and this step makes sure that the momentum distribution will have the
-  # same "maybe listified" underlying shape.
-  if not mcmc_util.is_list_like(momentum_distribution.dtype):
-    momentum_distribution = jds.JointDistributionSequential(
-        [momentum_distribution])
+  # Default momentum distribution is None
+  if momentum_distribution is None:
+    momentum_distribution = pu.make_momentum_distribution(
+        state_parts, ps.shape(target_log_prob),
+        shard_axis_names=experimental_shard_axis_names)
+  momentum_distribution = pu.maybe_make_list_and_batch_broadcast(
+      momentum_distribution, ps.shape(target_log_prob))
 
   if len(step_sizes) == 1:
     step_sizes *= len(state_parts)
